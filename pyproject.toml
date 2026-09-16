@@ -1,7 +1,7 @@
 [project]
 name = "opencode-go-proxy"
 version = "0.4.10"
-description = "Use your OpenCode Go subscription in Codex — local Responses-to-Chat-Completions bridge"
+description = "Local single-user adapter for using OpenCode Go and Zen models with Codex"
 readme = "README.md"
 authors = [{ name = "Kartik Kabadi", email = "1kartikkabadi1@gmail.com" }]
 license = "MIT"

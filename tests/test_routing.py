@@ -6,7 +6,11 @@ import unittest
 
 from opencode_go_proxy import zen_catalog
 from opencode_go_proxy.meter import state_dir
-from opencode_go_proxy.routing import normalize_model_slug, route_target
+from opencode_go_proxy.routing import (
+    is_known_model_slug,
+    normalize_model_slug,
+    route_target,
+)
 
 
 def _write_native_capture(slugs: list[str]) -> str:
@@ -101,6 +105,27 @@ class RouteTargetTests(unittest.TestCase):
         # Same path, newer content: the mtime cache must re-read.
         self.assertEqual(route_target("gpt-5.6-luna"), "opencode_go")
         self.assertEqual(route_target("gpt-5.5"), "native")
+
+
+class KnownModelTests(unittest.TestCase):
+    def test_known_go_model(self) -> None:
+        self.assertTrue(is_known_model_slug("deepseek-v4-flash"))
+        self.assertTrue(is_known_model_slug("opencode-go/deepseek-v4-flash"))
+
+    def test_unknown_model(self) -> None:
+        self.assertFalse(is_known_model_slug("no-such-model"))
+        self.assertFalse(is_known_model_slug("opencode-go/no-such-model"))
+
+    def test_known_native_requires_capture(self) -> None:
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertTrue(is_known_model_slug("gpt-5.6-luna"))
+        self.assertFalse(is_known_model_slug("gpt-5.5"))
+
+    def test_known_zen_requires_capture(self) -> None:
+        _seed_zen_ids(["claude-sonnet-4-5"])
+        self.assertTrue(is_known_model_slug("zen/claude-sonnet-4-5"))
+        self.assertTrue(is_known_model_slug("claude-sonnet-4-5"))
+        self.assertFalse(is_known_model_slug("zen/no-such-model"))
 
 
 class ZenRouteTargetTests(unittest.TestCase):

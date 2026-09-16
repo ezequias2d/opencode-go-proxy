@@ -36,7 +36,6 @@ from .meter import record_usage_event
 from .protocol import (
     DEFAULT_MODEL,
     flatten_content,
-    known_models,
     new_response_id,
     output_text_from_items,
 )
@@ -169,8 +168,6 @@ def _responses_text(response: Json) -> str:
 def _summarize_go(model: str, transcript: str, config: ProxyConfig, request_id: str) -> tuple[str, Any, Any, Any, int]:
     """One non-stream opencode-go chat-completions summarization call."""
     bare = normalize_model_slug(model)
-    if bare not in known_models():
-        bare = DEFAULT_MODEL
     chat_payload: Json = {
         "model": bare,
         "messages": [

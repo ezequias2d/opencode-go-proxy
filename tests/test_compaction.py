@@ -19,7 +19,7 @@ from unittest import mock
 
 import pytest
 
-from opencode_go_proxy import compaction
+from opencode_go_proxy import compaction, zen_catalog
 from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
 from opencode_go_proxy.meter import usage_events_path
 from opencode_go_proxy.secrets import clear_api_key_cache
@@ -615,6 +615,12 @@ def test_upstream_failure_surfaces_error_and_meters(
 def test_zen_compaction_routes_through_zen_upstream(
     proxy: _ScratchProxyServer, mock_upstream: _MockServer, scratch_port: int
 ) -> None:
+    with open(zen_catalog.zen_models_path(), "w") as handle:
+        json.dump(
+            {"fetched_at": "2026-08-14T00:00:00Z", "models": [{"id": MODEL}]},
+            handle,
+        )
+    zen_catalog._ZEN_MODELS_CACHE = None
     mock_upstream.behavior = ScriptedUpstream(MODE_OK)
     payload = {"model": ZEN_MODEL, "input": conversation_input("zen session")}
     status, _headers, raw = post_json(scratch_port, "/responses/compact", payload)

@@ -19,6 +19,7 @@ import traceback
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -26,7 +27,13 @@ from . import __version__
 from .compaction import COMPACT_PATHS, handle_compaction, has_compaction_trigger
 from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
-from .guards import check_browser_origin, check_content_type, check_host
+from .guards import (
+    check_browser_origin,
+    check_client,
+    check_content_type,
+    check_host,
+    validate_bind_security,
+)
 from .meter import (
     DEFAULT_ESTIMATE_CONTEXT_WINDOW,
     estimate_input_tokens,
@@ -43,7 +50,7 @@ from .protocol import (
     responses_payload_to_chat_payload,
 )
 from .quota import read_quota_state
-from .routing import OPENCODE_GO_PREFIX, route_target
+from .routing import OPENCODE_GO_PREFIX, is_known_model_slug, route_target
 from .state import build_state
 from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
@@ -75,6 +82,15 @@ MESSAGES_UNSUPPORTED: Json = {
         ),
     }
 }
+
+
+class ProxyHTTPServer(ThreadingHTTPServer):
+    """HTTP server that does not perform reverse DNS during bind."""
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = int(self.server_address[1])
 
 
 def _decompress_bounded(reader: Any, cap: int) -> bytes:
@@ -143,9 +159,10 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
 
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
     def _guard_request(self) -> None:
-        """Plan 006 transport guard: loopback Host, then no browser markers."""
+        """Enforce the local or explicitly authenticated remote boundary."""
         check_host(self.headers.get("Host"))
         check_browser_origin(self.headers)
+        check_client(self.client_address[0], self.headers)
 
     @staticmethod
     def _error_payload(exc: ProxyError) -> Json:
@@ -161,6 +178,25 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         if exc.headers and exc.headers.get("retry-after"):
             headers = {"retry-after": exc.headers["retry-after"]}
         self._send_json(self._error_payload(exc), status=exc.status, headers=headers)
+
+    @staticmethod
+    def _request_model(payload: Json) -> str:
+        raw_model = payload.get("model")
+        if raw_model is None:
+            return DEFAULT_MODEL
+        if not isinstance(raw_model, str) or not raw_model:
+            raise ProxyError(
+                HTTPStatus.BAD_REQUEST,
+                "model must be a non-empty string",
+                error_type="invalid_request_error",
+            )
+        if not is_known_model_slug(raw_model):
+            raise ProxyError(
+                HTTPStatus.BAD_REQUEST,
+                f"unknown model {raw_model!r}; refresh the catalog or add it to user-models.json",
+                error_type="model_not_found",
+            )
+        return raw_model
 
     def _reject_websocket_upgrade(self) -> bool:
         """Reject a realtime WebSocket upgrade with HTTP/1.1 426.
@@ -248,7 +284,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             check_content_type(self.headers.get("content-type"))
             config = self._config()
             payload = self._read_json(config)
-            model = payload.get("model") or DEFAULT_MODEL
+            model = (
+                self._request_model(payload)
+                if path in RESPONSES_PATHS
+                else payload.get("model") or DEFAULT_MODEL
+            )
             trace(
                 "request.received",
                 request_id=request_id,
@@ -733,6 +773,14 @@ def main(argv: list[str] | None = None) -> None:
 
         sys.exit(ops.update_cmd(args_list[1:]))
     args = build_parser().parse_args(args_list)
+    if args.timeout_sec <= 0:
+        sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
+        sys.exit(2)
+    try:
+        validate_bind_security(args.bind)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        sys.exit(2)
     try:
         from opencode_go_proxy import catalog as _catalog
         from opencode_go_proxy import native_models
@@ -748,13 +796,6 @@ def main(argv: list[str] | None = None) -> None:
         _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
-    # The full refresh may fetch models.dev (up to a 10s timeout); run it in
-    # the background so startup never blocks on the network, and keep a
-    # low-frequency timer re-running it (both threads daemon=True).
-    _start_catalog_refresh()
-    if args.timeout_sec <= 0:
-        sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
-        sys.exit(2)
     config = ProxyConfig(
         bind=args.bind,
         port=args.port,
@@ -764,9 +805,12 @@ def main(argv: list[str] | None = None) -> None:
         max_body_bytes=args.max_body_mb * 1024 * 1024,
     )
     if config.bind not in {"127.0.0.1", "localhost", "::1"}:
-        trace("security.warning", bind=config.bind,
-              message="binding to non-localhost address — proxy exposes upstream API key to network")
-    server = ThreadingHTTPServer((config.bind, config.port), ResponsesProxyHandler)
+        trace(
+            "security.remote_enabled",
+            bind=config.bind,
+            message="non-loopback listener protected by a separate caller token",
+        )
+    server = ProxyHTTPServer((config.bind, config.port), ResponsesProxyHandler)
     server.config = config  # type: ignore[attr-defined]
     trace(
         "server.start",
@@ -782,6 +826,9 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
     try:
         serve_thread.start()
+        # Network catalog refresh starts only after the listener is ready, so
+        # slow discovery cannot delay local health checks or client startup.
+        _start_catalog_refresh()
         serve_thread.join()
     except KeyboardInterrupt:
         trace("server.stop", reason="keyboard_interrupt")

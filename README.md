@@ -5,7 +5,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Dependencies: zstandard](https://img.shields.io/badge/dependencies-zstandard-blue.svg)](#)
 
-Use your [OpenCode Go](https://opencode.ai/docs/go) and [OpenCode Zen](https://opencode.ai/zen) access in the [Codex app](https://github.com/openai/codex).
+Use your own [OpenCode Go](https://opencode.ai/docs/go) and
+[OpenCode Zen](https://opencode.ai/zen) credentials in
+[Codex](https://github.com/openai/codex) through a local protocol adapter.
 
 Codex expects a Responses API (`/v1/responses`). OpenCode Go exposes an OpenAI-compatible
 Chat Completions API (`/v1/chat/completions`), and OpenCode Zen serves GPT, Claude, Gemini,
@@ -24,6 +26,28 @@ opencode-go-proxy  ←── localhost:8787, one runtime dep (zstandard)
 OpenCode Go / OpenCode Zen  ── 13 open Go models · GPT, Claude, Gemini, Grok, DeepSeek, GLM, Kimi, Qwen
 ```
 
+## Project and policy boundary
+
+OpenCode Go Proxy is an independent, single-user local adapter. It is not an
+OpenAI or OpenCode product, and neither company sponsors or endorses it. It
+does not provide shared accounts, pooled credentials, subscription resale, or
+mechanisms to evade provider limits or safeguards.
+
+The proxy uses Codex's documented `openai_base_url`, custom provider, and model
+catalog configuration surfaces. When native OpenAI models are enabled, it
+relays the user's existing Codex authorization only to the configured native
+OpenAI endpoint over HTTPS; it never stores that authorization or uses it as
+an OpenCode credential. OpenCode credentials are likewise never sent to the
+native OpenAI endpoint.
+
+Users are responsible for using their own accounts and following the current
+[OpenAI Terms of Use](https://openai.com/terms),
+[OpenAI Services Agreement](https://openai.com/policies/services-agreement/),
+OpenCode terms, and any model-provider policies that apply to them. See
+[Codex advanced configuration](https://developers.openai.com/codex/config-advanced)
+and [SECURITY.md](SECURITY.md). This project documents technical safeguards;
+it does not provide legal or policy certification.
+
 ## Why
 
 OpenCode Go is $5 for the first month, then $10/month. You get access to 13 open coding models
@@ -35,41 +59,25 @@ This proxy fixes that for both.
 ## Quick start
 
 ```bash
-# Install and run
+# Configure Codex (writes one marker-delimited block to ~/.codex/config.toml)
+uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy \
+  opencode-go-proxy config enable
+
+# Run the loopback-only adapter
 uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy \
   opencode-go-proxy \
   --bind 127.0.0.1 \
   --port 8787
 
-# Point Codex at it (~/.codex/config.toml)
-```
-
-```toml
-[model_providers.opencode-go]
-name = "OpenCode Go"
-base_url = "http://127.0.0.1:8787/v1"
-experimental_bearer_token = "any-string-here"
-wire_api = "responses"
-
-[profiles.deepseek-v4-flash]
-model_provider = "opencode-go"
-model = "deepseek-v4-flash"
-model_context_window = 1000000
-approval_policy = "untrusted"
-sandbox_mode = "workspace-write"
-features = { memories = false }
-```
-
-```bash
-# Start Codex with a profile
-codex -p deepseek-v4-flash
+# Fully restart Codex, then select a model in the picker or CLI
+codex -m deepseek-v4-flash
 ```
 
 ## Available models
 
 All 13 OpenCode Go models work through this proxy. The defaults are DeepSeek V4 Flash
 (cheapest general-purpose) and MiMo V2.5 (cheapest vision, used for image captioning).
-Switch to whatever you want — just change the model in your Codex profile.
+Switch to whatever you want in the Codex model picker or with `codex -m`.
 
 | Model | Slug | Best for | Requests/mo on Go |
 |-------|------|----------|-------------------|
@@ -92,50 +100,23 @@ typical usage patterns. Cheaper models = more requests per month.
 
 ### Switching models
 
-Just create another profile and use `codex -p <profile-name>`:
-
-```toml
-[profiles.deepseek-v4-pro]
-model_provider = "opencode-go"
-model = "deepseek-v4-pro"
-model_context_window = 1000000
-approval_policy = "untrusted"
-sandbox_mode = "workspace-write"
-features = { memories = false }
-
-[profiles.glm-5.2]
-model_provider = "opencode-go"
-model = "glm-5.2"
-model_context_window = 272000
-approval_policy = "untrusted"
-sandbox_mode = "workspace-write"
-features = { memories = false }
-
-[profiles.kimi-k2.7-code]
-model_provider = "opencode-go"
-model = "kimi-k2.7-code"
-model_context_window = 272000
-approval_policy = "untrusted"
-sandbox_mode = "workspace-write"
-features = { memories = false }
-```
-
 ```bash
-codex -p deepseek-v4-pro
-codex -p glm-5.2
-codex -p kimi-k2.7-code
+codex -m deepseek-v4-pro
+codex -m glm-5.2
+codex -m kimi-k2.7-code
 ```
 
-### How the default model is chosen
+### How models are routed
 
-The proxy picks the upstream model based on what Codex sends:
+The proxy routes the exact model Codex sends:
 
-1. If the model slug is `zen/`-prefixed, it routes to the OpenCode Zen gateway
-   instead (see [OpenCode Zen](#opencode-zen)); the prefix wins over everything below.
-2. If the model slug is in the [alias map](src/opencode_go_proxy/protocol.py), it's mapped
-   (e.g. `gpt-5.5` → `deepseek-v4-pro`).
-3. If the model slug is a known OpenCode Go model (from the catalog), it's used as-is.
-4. Otherwise, it falls back to `deepseek-v4-flash`.
+1. `opencode-go/<id>` explicitly selects a known OpenCode Go catalog entry.
+2. `zen/<id>` explicitly selects a known OpenCode Zen catalog entry.
+3. A bare ID in the captured native catalog routes to the native OpenAI endpoint.
+4. A known bare Go ID routes to Go; a known Zen-only bare ID routes to Zen.
+5. An omitted model uses `deepseek-v4-flash`. An unknown or malformed model is
+   rejected before any upstream request; the proxy never silently substitutes
+   another model.
 
 When images are present in a turn with tools, the proxy captions the latest image
 (older ones are stubbed) and routes the main turn to your configured model. Image
@@ -162,18 +143,8 @@ Since 0.4.0 the proxy also serves [OpenCode Zen](https://opencode.ai/zen), the
 pay-as-you-go gateway with GPT, Claude, Gemini, Grok, DeepSeek, GLM, Kimi, and Qwen
 models. Zen models are auto-discovered from `https://opencode.ai/zen/v1/models` (no
 auth), merged with models.dev metadata, and appear in the catalog and `/v1/models`
-as `zen/<id>` slugs (e.g. `zen/claude-sonnet-4-5`). Point a Codex profile at one the
-same way you do Go models:
-
-```toml
-[profiles.claude-sonnet-4-5]
-model_provider = "opencode-go"
-model = "zen/claude-sonnet-4-5"
-model_context_window = 200000
-approval_policy = "untrusted"
-sandbox_mode = "workspace-write"
-features = { memories = false }
-```
+as `zen/<id>` slugs (e.g. `zen/claude-sonnet-4-5`). Select one in the model
+picker or run `codex -m zen/claude-sonnet-4-5`.
 
 Requests route by model family, translated from the Responses API the proxy always
 speaks to the surface the gateway expects:
@@ -238,7 +209,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Real-time SSE streaming (not synthesized)
 - Cached image captioning when tools are present: cheapest catalog vision engine (or a probed local runtime) by default, `detail: low` input, 30s no-retry budget, MiMo V2.5 fallback, reads metered with `kind=vision`
 - SSRF protection on image URLs (`data:image/` and `https://` only)
-- Configurable body cap, bind address guard, keychain credential resolution
+- Configurable body cap, peer-address guard, authenticated remote mode, keychain credential resolution
 - Local health and model-list endpoints
 - Prefix caching: byte-stable request prefixes plus `include_usage`, with per-model hit ratio on `/cache`
 - Honest usage meter: append-only `usage-events.jsonl` in the state dir (truncated or empty responses never count as success)
@@ -246,7 +217,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Ops CLI: `doctor` (reference-style checks with `--fix` for safe repairs), `smoke-test` (marker prompt through the local proxy), `support-bundle` (JSON schema v1, mode 0600), `install` (points at the macOS menu bar app; no launchd agent), `install-skills`, `refresh-runtime`, and `status`
 - Spawned threads inherit the parent session's model (`create_thread`; `chatgptWorkCloud` targets are skipped)
 - Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
-- Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
+- Auth transport guard (zero config): the default listener and accepted peers are loopback-only, forged `Host: localhost` does not admit a remote peer, browser-originated requests answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
 - Verbatim `/v1/chat/completions` passthrough (stream and non-stream): the upstream status and body are relayed byte-for-byte, including the upstream's own error body, and `/v1/messages` answers an explicit `400`
 - Rate-limit harvesting (plan 011): upstream `x-ratelimit-*` and `anthropic-ratelimit-*` headers are parsed into per-provider quota snapshots, the latest snapshot per provider is kept, and `GET /quota` exposes `quota-state.json`
 - Menu bar state contract (plan 013): `GET /state` returns one JSON document (status, port, upstream, latest quota snapshot, today's turns/tokens, last-7-day token bars, current model) computed from the meter file and quota state
@@ -452,11 +423,11 @@ prints the exact one-liner to run instead.
 Pin the install to the newest tag:
 
 ```bash
-uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.0 \
+uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.10 \
   opencode-go-proxy --bind 127.0.0.1 --port 8787
 ```
 
-Replace `v0.4.0` with the newest tag from
+Replace `v0.4.10` with the newest tag from
 [releases](https://github.com/kartikkabadi/opencode-go-proxy/releases).
 For the systemd unit, update the `ExecStart` URL in
 `contrib/systemd/opencode-go-proxy.service` to the same pinned form, then
@@ -481,6 +452,33 @@ All flags have environment variable defaults:
 The proxy accepts both `/responses` and `/v1/responses`.
 
 The upstream base URL resolves in this order: the `--chat-base-url` flag, then `OPENCODE_GO_BASE_URL`, then `OPENCODE_ZEN_BASE_URL`, then the legacy `CHAT_COMPLETIONS_BASE_URL`, then the built-in default.
+
+### Remote access
+
+Keep the proxy on loopback whenever possible. A non-loopback bind fails closed
+unless both remote mode and a separate caller capability are configured:
+
+```bash
+export OPENCODE_GO_PROXY_ALLOW_REMOTE=1
+export OPENCODE_GO_PROXY_CALLER_TOKEN="$(openssl rand -hex 32)"
+opencode-go-proxy --bind 0.0.0.0
+```
+
+Every non-loopback client must send the token in
+`X-OpenCode-Go-Proxy-Token`. For a Codex custom provider, pass it from the
+environment rather than writing the value into config:
+
+```toml
+[model_providers.opencode-go-remote]
+name = "OpenCode Go Remote"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+env_http_headers = { "X-OpenCode-Go-Proxy-Token" = "OPENCODE_GO_PROXY_CALLER_TOKEN" }
+```
+
+Use TLS and network-level access controls for any remote deployment. The caller
+token is only a proxy access capability; it is never used as or forwarded as a
+provider credential. Browser-originated requests remain blocked in remote mode.
 
 **One HTTP port only.** The proxy binds a single listener: `OPENCODE_GO_PROXY_PORT`
 (default `8787`). There is no admin port, control channel, or secondary service. If
@@ -559,7 +557,7 @@ cp ~/.codex/opencode-go-proxy/opencode-go-catalog.json ~/.codex/model-catalogs/o
 ```
 
 ```toml
-model_catalog_json = "/home/you/.codex/model-catalogs/opencode-go.json"
+model_catalog_json = "/absolute/path/to/.codex/model-catalogs/opencode-go.json"
 ```
 
 The catalog ships with the `ModelsCache` wrapper (`fetched_at`/`etag`/`client_version`/`models`).
@@ -577,9 +575,11 @@ GPT models and custom models side by side, with official OAuth untouched.
 
 Routing is by model: a slug in the captured native set goes verbatim to
 `https://chatgpt.com/backend-api/codex` (override with
-`OPENCODE_GO_PROXY_NATIVE_BASE_URL`), anything else goes through the normal
-translation to OpenCode Go. Run `refresh-runtime` after logging in or out of
-an account to recapture.
+`OPENCODE_GO_PROXY_NATIVE_BASE_URL`), while known Go and Zen catalog entries go
+through their translation paths. Unknown IDs are rejected. Run
+`refresh-runtime` after logging in or out of an account to recapture.
+Only set the native base URL override to an endpoint you trust with the
+client's native Codex authorization.
 
 ### Local model overlay
 
@@ -646,7 +646,9 @@ OpenCode Go has 5-hour/weekly/monthly usage limits. Switch to a cheaper model (D
 Codex sends `stream: true` — the proxy handles this. If you see no SSE events, check stderr trace for `upstream.error` or `upstream.network_error`.
 
 **Codex says "model is not supported when using ChatGPT account"**
-You used `codex -m deepseek-v4-flash` instead of `codex -p deepseek-v4-flash`. The `-m` flag only changes the model name, not the provider. Use `-p` to select a profile.
+Run `opencode-go-proxy config enable`, fully restart Codex, and confirm
+`openai_base_url` points at the local proxy. The managed setup uses Codex's
+documented proxy configuration so native and routed catalog models can coexist.
 
 ## Development
 

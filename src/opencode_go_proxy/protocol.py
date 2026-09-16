@@ -633,15 +633,11 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     # one arrives here anyway, its model is never rewritten. For opencode-go
     # targets the prefixed slug is checked against the catalog by its bare
     # form, and the upstream chat payload addresses the provider with the
-    # bare slug (the reference router's upstreamModel). Unknown non-native
-    # slugs fall back to DEFAULT_MODEL, exactly as before the alias map died.
+    # bare slug.
     if route_target(incoming_model) == "native":
         upstream_model = incoming_model
     else:
         bare = normalize_model_slug(incoming_model)
-        if bare not in known_models():
-            incoming_model = DEFAULT_MODEL
-            bare = incoming_model
         if has_image:
             if bare in image_capable_models():
                 upstream_model = bare

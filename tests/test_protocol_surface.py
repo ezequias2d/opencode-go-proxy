@@ -123,6 +123,25 @@ class TestChatCompletionsPassthrough:
         assert resp.status == 200
         assert raw == upstream_body
 
+    def test_unknown_model_remains_verbatim_on_chat_surface(self, server):
+        port, _ = server
+        upstream_body = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode("utf-8")
+        request_body = json.dumps({
+            "model": "new-upstream-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen",
+            return_value=MockUpstreamResponse(upstream_body),
+        ) as mock_urlopen:
+            resp, raw = post(port, "/v1/chat/completions", request_body)
+
+        assert resp.status == 200
+        assert raw == upstream_body
+        sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
+        assert sent_payload["model"] == "new-upstream-model"
+
     def test_upstream_429_status_and_body_relayed_verbatim(self, server):
         port, _ = server
         err_body = b'{"error":{"message":"over quota","type":"insufficient_quota"}}'
