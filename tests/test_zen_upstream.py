@@ -734,6 +734,14 @@ class TestAppDispatch:
         client and the opencode-go upstream sees zero traffic."""
         state = tmp_path / "state"
         state.mkdir(exist_ok=True)
+        (state / "zen-models.json").write_text(
+            json.dumps(
+                {
+                    "fetched_at": "2026-08-14T00:00:00Z",
+                    "models": [{"id": "deepseek-v4-flash"}],
+                }
+            )
+        )
         from opencode_go_proxy.app import ResponsesProxyHandler
 
         go_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeZenUpstream)
