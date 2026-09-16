@@ -33,6 +33,30 @@ GO_PREFIX = "opencode-go/"
 GO_PROVIDER = "opencode-go"
 
 
+def _client_status(status: int) -> int:
+    if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        return HTTPStatus.BAD_GATEWAY
+    return status
+
+
+def _network_error(exc: BaseException, retries: int) -> ProxyError:
+    if isinstance(exc, TimeoutError) or (
+        isinstance(exc, urllib.error.URLError)
+        and isinstance(exc.reason, TimeoutError)
+    ):
+        return ProxyError(
+            HTTPStatus.GATEWAY_TIMEOUT,
+            "opencode-go upstream timeout",
+            retries=retries,
+        )
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return ProxyError(
+        HTTPStatus.BAD_GATEWAY,
+        f"opencode-go upstream network error: {reason}",
+        retries=retries,
+    )
+
+
 def bare_go_id(slug: str) -> str:
     """Strip the explicit Go provider prefix at the wire boundary."""
     return slug.removeprefix(GO_PREFIX)
@@ -142,19 +166,16 @@ def _handle_go_verbatim_request(
         except _ConnectFailed as fail:
             exc = fail.exc
             if isinstance(exc, urllib.error.HTTPError):
-                _relay_upstream_error(handler, exc.code, fail.body, exc.headers)
+                status = _client_status(exc.code)
+                _relay_upstream_error(handler, status, fail.body, exc.headers)
                 record_usage_event(
                     model=model,
-                    status=exc.code,
+                    status=status,
                     duration_ms=int((time.time() - started) * 1000),
                     retries=fail.attempts or None,
                 )
                 return
-            raise ProxyError(
-                HTTPStatus.BAD_GATEWAY,
-                f"opencode-go upstream network error: {getattr(exc, 'reason', exc)}",
-                retries=fail.attempts,
-            ) from exc
+            raise _network_error(exc, fail.attempts) from exc
         handler.send_response(HTTPStatus.OK)
         handler.send_header("content-type", "text/event-stream")
         handler.send_header("cache-control", "no-cache")
@@ -202,18 +223,15 @@ def _handle_go_verbatim_request(
                 retries += 1
                 retry_sleep(retries)
                 continue
-            raise ProxyError(
-                HTTPStatus.BAD_GATEWAY,
-                f"opencode-go upstream network error: {getattr(exc, 'reason', exc)}",
-                retries=retries,
-            ) from exc
+            raise _network_error(exc, retries) from exc
+    client_status = _client_status(status)
     record_usage_event(
         model=model,
-        status=status,
+        status=client_status,
         duration_ms=int((time.time() - started) * 1000),
         retries=retries or None,
     )
-    handler.send_response(status)
+    handler.send_response(client_status)
     handler.send_header("content-type", content_type)
     if retry_after:
         handler.send_header("retry-after", retry_after)

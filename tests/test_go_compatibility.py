@@ -108,33 +108,34 @@ def test_explicit_and_safe_bare_selection_reject_unknown_ids() -> None:
         go_upstream.go_request_identity("opencode-go/")
 
 
-@pytest.mark.parametrize(
-    ("model", "path", "auth"),
-    [
-        ("opencode-go/grok-4.6", "/responses", "authorization"),
-        ("glm-5.3-flash", "/chat/completions", "authorization"),
-        ("opencode-go/minimax-m3", "/messages", "x-api-key"),
-    ],
-)
-def test_responses_adapter_selects_documented_endpoint_and_auth(
+@pytest.mark.parametrize("model", sorted(DOCUMENTED_GO_MODELS))
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_adapter_supports_every_documented_model(
     model: str,
-    path: str,
-    auth: str,
+    stream: bool,
 ) -> None:
-    bare_id, family = go_upstream.go_request_identity(model)
+    selected_model = f"opencode-go/{model}"
+    bare_id, family = go_upstream.go_request_identity(selected_model)
     url, body, headers = zen_upstream._build_family_request(
-        {"model": model, "input": "hello"},
+        {"model": selected_model, "input": "hello", "stream": stream},
         family,
         bare_id,
         "go-key",
-        stream=False,
-        session_model=model,
+        stream=stream,
+        session_model=selected_model,
         base_url=config().chat_base_url,
         extra_headers={"x-opencode-session": "session-1"},
         function_tools_only=True,
     )
+    path = {
+        OPENAI_RESPONSES: "/responses",
+        OPENAI_CHAT: "/chat/completions",
+        ANTHROPIC_MESSAGES: "/messages",
+    }[family]
+    auth = "x-api-key" if family == ANTHROPIC_MESSAGES else "authorization"
     assert url.endswith(path)
     assert body["model"] == bare_id
+    assert body["stream"] is stream
     assert headers[auth] == (
         "Bearer go-key" if auth == "authorization" else "go-key"
     )
@@ -279,6 +280,100 @@ def test_go_chat_and_messages_verbatim_paths_keep_credentials_separate() -> None
         "messages-session"
     )
     assert "authorization" not in request_headers(messages_request)
+
+
+@pytest.mark.parametrize("model", sorted(DOCUMENTED_CHAT_MODELS))
+def test_direct_chat_surface_supports_every_chat_model(model: str) -> None:
+    captured = []
+
+    def fake_urlopen(request, **kwargs):
+        captured.append(request)
+        return response({"id": "chatcmpl_1", "choices": []})
+
+    with (
+        mock.patch(
+            "opencode_go_proxy.go_upstream.resolve_api_key",
+            return_value="go-key",
+        ),
+        mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+    ):
+        handler = Handler()
+        go_upstream.handle_go_chat_request(
+            handler,
+            {
+                "model": f"opencode-go/{model}",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            config(),
+            "chat-request",
+        )
+
+    assert handler.status == 200
+    assert captured[0].full_url.endswith("/chat/completions")
+    assert request_body(captured[0])["model"] == model
+
+
+@pytest.mark.parametrize("model", sorted(DOCUMENTED_MESSAGES_MODELS))
+def test_direct_messages_surface_supports_every_messages_model(model: str) -> None:
+    captured = []
+
+    def fake_urlopen(request, **kwargs):
+        captured.append(request)
+        return response({"id": "msg_1", "content": []})
+
+    with (
+        mock.patch(
+            "opencode_go_proxy.go_upstream.resolve_api_key",
+            return_value="go-key",
+        ),
+        mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+    ):
+        handler = Handler()
+        go_upstream.handle_go_messages_request(
+            handler,
+            {
+                "model": f"opencode-go/{model}",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            config(),
+            "messages-request",
+        )
+
+    assert handler.status == 200
+    assert captured[0].full_url.endswith("/messages")
+    assert request_body(captured[0])["model"] == model
+
+
+@pytest.mark.parametrize(
+    "model",
+    sorted(DOCUMENTED_RESPONSES_MODELS | DOCUMENTED_MESSAGES_MODELS),
+)
+def test_direct_chat_rejects_non_chat_models(model: str) -> None:
+    with pytest.raises(ProxyError) as error:
+        go_upstream.handle_go_chat_request(
+            Handler(),
+            {"model": f"opencode-go/{model}", "messages": []},
+            config(),
+            "chat-request",
+        )
+    assert error.value.status == 400
+    assert error.value.error_type == "invalid_request_error"
+
+
+@pytest.mark.parametrize(
+    "model",
+    sorted(DOCUMENTED_RESPONSES_MODELS | DOCUMENTED_CHAT_MODELS),
+)
+def test_direct_messages_rejects_non_messages_models(model: str) -> None:
+    with pytest.raises(ProxyError) as error:
+        go_upstream.handle_go_messages_request(
+            Handler(),
+            {"model": f"opencode-go/{model}", "messages": []},
+            config(),
+            "messages-request",
+        )
+    assert error.value.status == 400
+    assert error.value.error_type == "invalid_request_error"
 
 
 def test_merged_catalog_uses_explicit_go_slugs_for_native_collisions(

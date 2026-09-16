@@ -154,7 +154,7 @@ class TestChatCompletionsPassthrough:
         assert raw == err_body
         assert b"proxy_error" not in raw
 
-    def test_upstream_500_status_and_body_relayed_verbatim(self, server):
+    def test_upstream_500_maps_to_502_and_keeps_body(self, server):
         port, _ = server
         err_body = b'{"error":{"message":"internal boom"}}'
 
@@ -163,7 +163,7 @@ class TestChatCompletionsPassthrough:
         }), mock.patch("urllib.request.urlopen", side_effect=http_error(500, err_body)):
             resp, raw = post(port, "/v1/chat/completions", chat_body())
 
-        assert resp.status == 500
+        assert resp.status == 502
         assert raw == err_body
 
     def test_streaming_relays_sse_verbatim(self, server):
@@ -211,6 +211,19 @@ class TestChatCompletionsPassthrough:
             resp, raw = post(port, "/v1/chat/completions", chat_body(stream=True))
 
         assert resp.status == 429
+        assert raw == err_body
+        assert "text/event-stream" not in resp.getheader("content-type", "")
+
+    def test_streaming_upstream_500_maps_to_502_before_commit(self, server):
+        port, _ = server
+        err_body = b'{"error":{"message":"internal boom"}}'
+
+        with mock.patch.dict(os.environ, {
+            "OPENCODE_GO_API_KEY": "test-key", "OPENCODE_GO_PROXY_MAX_RETRIES": "0",
+        }), mock.patch("urllib.request.urlopen", side_effect=http_error(500, err_body)):
+            resp, raw = post(port, "/v1/chat/completions", chat_body(stream=True))
+
+        assert resp.status == 502
         assert raw == err_body
         assert "text/event-stream" not in resp.getheader("content-type", "")
 
@@ -298,6 +311,25 @@ class TestMessagesEndpoint:
 
         assert resp.status == 400
         assert json.loads(raw)["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_upstream_500_maps_to_502_and_keeps_body(self, server, stream):
+        port, _ = server
+        err_body = b'{"type":"error","error":{"message":"internal boom"}}'
+        body = json.dumps({
+            "model": "opencode-go/minimax-m3",
+            "messages": [],
+            "stream": stream,
+        }).encode()
+
+        with mock.patch.dict(os.environ, {
+            "OPENCODE_GO_API_KEY": "test-key", "OPENCODE_GO_PROXY_MAX_RETRIES": "0",
+        }), mock.patch("urllib.request.urlopen", side_effect=http_error(500, err_body)):
+            resp, raw = post(port, "/v1/messages", body)
+
+        assert resp.status == 502
+        assert raw == err_body
+        assert "text/event-stream" not in resp.getheader("content-type", "")
 
     def test_get_messages_returns_405(self, server):
         port, _ = server

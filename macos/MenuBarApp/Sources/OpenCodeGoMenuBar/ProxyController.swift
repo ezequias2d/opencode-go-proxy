@@ -24,7 +24,7 @@ enum ProxySourceResolver {
     static let defaultsKey = "proxySource"
 
     /// The pinned source baked into this build (bumped at release time).
-    static let compiledSource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.8"
+    static let compiledSource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.10"
 
     /// A defaults override wins over the compiled pin; an empty or missing
     /// value falls back to `fallbackProxySource` (the compiled pin).
@@ -516,8 +516,8 @@ final class ProxyController {
     }
 
     private func childEnvironment() -> [String] {
-        // Menu bar apps launch without the shell PATH; give the child the same
-        // PATH shape as the launchd plist plus a stable HOME.
+        // Menu bar apps launch without the shell PATH; give the child a stable
+        // user-tool PATH and HOME.
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let processInfo = ProcessInfo.processInfo
         var vars = processInfo.environment

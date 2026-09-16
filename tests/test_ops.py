@@ -1,8 +1,10 @@
 import io
 import json
 import os
+import tomllib
 import urllib.error
 import urllib.request
+from pathlib import Path
 from unittest import mock
 
 from opencode_go_proxy import ops
@@ -330,6 +332,36 @@ class TestInstall:
     def test_points_at_menu_bar_app(self, capsys) -> None:
         assert ops.install([]) == 0
         assert "menu bar" in capsys.readouterr().out
+
+
+class TestPlatformServiceContract:
+    def test_systemd_runs_one_pinned_truthful_proxy(self) -> None:
+        root = Path(__file__).parents[1]
+        version = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+            "version"
+        ]
+        service = (
+            root / "contrib/systemd/opencode-go-proxy.service"
+        ).read_text()
+        exec_lines = [
+            line for line in service.splitlines() if line.startswith("ExecStart=")
+        ]
+        assert len(exec_lines) == 1
+        assert f"opencode-go-proxy@v{version}" in exec_lines[0]
+        assert "--bind 127.0.0.1 --port 8787" in exec_lines[0]
+        assert "OPENCODE_GO_PROXY_USER_AGENT=" not in service
+
+    def test_menu_bar_pin_matches_package_version(self) -> None:
+        root = Path(__file__).parents[1]
+        version = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+            "version"
+        ]
+        controller = (
+            root
+            / "macos/MenuBarApp/Sources/OpenCodeGoMenuBar/ProxyController.swift"
+        ).read_text()
+        assert f"opencode-go-proxy@v{version}" in controller
+        assert not (root / "contrib/launchd").exists()
 
 
 class TestInstallSkills:

@@ -13,7 +13,7 @@ The menu bar shows a small branch icon (no long "opencode go/" text). The menu s
 - Today's turns and tokens, plus a 7-day token bar list (from `GET /state`)
 - current model (the most recent meter event, else the proxy default)
 - Start/Stop Proxy: launches `uvx --from git+... opencode-go-proxy` as a child process,
-  writing logs to `~/.codex/logs/opencode-go-proxy.{log,err}` (same paths as the launchd plist)
+  writing logs to `~/.codex/logs/opencode-go-proxy.{log,err}`
 - Open Logs / Reveal Log File
 - Copy Port
 - Quit (stops the child proxy first)
@@ -41,10 +41,10 @@ cp -R .build/release/OpenCodeGoMenuBar OpenCodeGoMenuBar.app/Contents/MacOS/
 ## Notes
 
 - The Python bridge is untouched; the app only manages it as a child process.
-- Single-port guard: the app refuses to Start if another process already listens on
-  127.0.0.1:8787 (for example the launchd agent), instead of spawning a second proxy that
-  would fail to bind. One proxy per port. To switch from launchd to the menu bar, stop the
-  launchd agent first (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist`).
+- Single-service, single-port: the menu bar app is the macOS supervisor and owns one
+  child proxy on `127.0.0.1:8787`. It refuses to start when another process owns the
+  port and automatically unloads the recognized pre-0.3.0 launchd job during migration.
+  Do not run a separate launchd proxy alongside the app.
 - The spawned proxy resolves the API key exactly as the CLI does: `$OPENCODE_GO_API_KEY`
   first, then `$OPENCODE_API_KEY`, then the macOS keychain services `opencode-go-api-key`
   and `codex-router-opencode-go`.

@@ -109,6 +109,23 @@ or protocol-certified IDs, so an unknown ID is not guessed into the wrong
 protocol. The checked-in seed keeps startup and model selection working
 offline.
 
+### HTTP API compatibility
+
+The one listener accepts all three documented client formats, with or without
+the `/v1` prefix:
+
+| Client request | Supported Go models | Upstream behavior |
+|----------------|---------------------|-------------------|
+| `POST /v1/responses` | all 28 documented models | translated to each model's certified Responses, Chat Completions, or Messages family |
+| `POST /v1/chat/completions` | the 16 Chat Completions models | relayed in Chat Completions format |
+| `POST /v1/messages` | the 8 Anthropic Messages models | relayed in Messages format |
+
+Streaming and non-streaming requests are supported on every row. The Responses
+aliases `/responses/compact` and `/v1/responses/compact` are also available for
+compaction. A model sent to an incompatible direct-format endpoint is rejected
+before any upstream request rather than silently translated to a different
+client response shape.
+
 ### Switching models
 
 ```bash
@@ -431,7 +448,8 @@ The supported way to run the proxy on macOS is the menu bar app in
 `macos/MenuBarApp`. Build it in Xcode (or `swift build`), launch it, and it
 spawns the proxy itself and shows status, quota, and today's usage. There is
 no launchd agent anymore: `contrib/launchd/` was removed in 0.3.0, and the
-`install` ops command points at the menu bar app instead of a plist.
+`install` ops command points at the menu bar app instead of a plist. The app
+is the only supervisor: do not run another proxy service beside it.
 
 ## Updating
 
@@ -461,9 +479,22 @@ when an update is available). `--apply` re-installs from the new tag with
 `uv tool install --force`; when the proxy was not installed as a tool it
 prints the exact one-liner to run instead.
 
-### Manual / systemd
+### Linux (systemd user service)
 
-Pin the install to the newest tag:
+Install the checked-in user service, then start its single proxy process:
+
+```bash
+mkdir -p ~/.config/systemd/user
+curl -fsSL \
+  https://raw.githubusercontent.com/kartikkabadi/opencode-go-proxy/v0.4.10/contrib/systemd/opencode-go-proxy.service \
+  -o ~/.config/systemd/user/opencode-go-proxy.service
+systemctl --user daemon-reload
+systemctl --user enable --now opencode-go-proxy
+curl http://127.0.0.1:8787/health
+```
+
+The unit owns the same one listener used on macOS; do not run a second manual
+proxy while it is active. For a foreground/manual Linux run, use:
 
 ```bash
 uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.10 \
@@ -472,7 +503,7 @@ uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.10 \
 
 Replace `v0.4.10` with the newest tag from
 [releases](https://github.com/kartikkabadi/opencode-go-proxy/releases).
-For the systemd unit, update the `ExecStart` URL in
+For updates, change the pinned `ExecStart` URL in
 `contrib/systemd/opencode-go-proxy.service` to the same pinned form, then
 `systemctl --user daemon-reload && systemctl --user restart opencode-go-proxy`.
 
@@ -523,11 +554,12 @@ Use TLS and network-level access controls for any remote deployment. The caller
 token is only a proxy access capability; it is never used as or forwarded as a
 provider credential. Browser-originated requests remain blocked in remote mode.
 
-**One HTTP port only.** The proxy binds a single listener: `OPENCODE_GO_PROXY_PORT`
-(default `8787`). There is no admin port, control channel, or secondary service. If
-something else already listens on the port, the proxy fails to bind — check with
-`lsof -nP -iTCP:8787 -sTCP:LISTEN` before starting a second instance. The menu bar
-app refuses Start when 8787 is already owned.
+**One service and one HTTP port only.** The proxy binds a single listener:
+`OPENCODE_GO_PROXY_PORT` (default `8787`). There is no admin port, control
+channel, or secondary service. The macOS menu bar app or the Linux systemd user
+unit supervises that one process. If something else already listens on the port,
+the proxy fails to bind — check with `lsof -nP -iTCP:8787 -sTCP:LISTEN` before
+starting another instance. The menu bar app refuses Start when 8787 is owned.
 
 **Short provider name.** The long "opencode go/" label in the Codex model picker comes
 from the provider config in `~/.codex/config.toml`, not from this proxy. Shorten it by
