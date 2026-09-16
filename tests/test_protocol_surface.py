@@ -1,4 +1,4 @@
-"""Plan 005 protocol surface: /chat/completions passthrough, /messages 400, WS 426."""
+"""HTTP protocol surfaces for Chat Completions, Messages, and WebSockets."""
 
 import io
 import json
@@ -123,7 +123,7 @@ class TestChatCompletionsPassthrough:
         assert resp.status == 200
         assert raw == upstream_body
 
-    def test_unknown_model_remains_verbatim_on_chat_surface(self, server):
+    def test_unknown_model_is_rejected_on_chat_surface(self, server):
         port, _ = server
         upstream_body = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode("utf-8")
         request_body = json.dumps({
@@ -137,10 +137,9 @@ class TestChatCompletionsPassthrough:
         ) as mock_urlopen:
             resp, raw = post(port, "/v1/chat/completions", request_body)
 
-        assert resp.status == 200
-        assert raw == upstream_body
-        sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
-        assert sent_payload["model"] == "new-upstream-model"
+        assert resp.status == 400
+        assert json.loads(raw)["error"]["type"] == "model_not_found"
+        mock_urlopen.assert_not_called()
 
     def test_upstream_429_status_and_body_relayed_verbatim(self, server):
         port, _ = server
@@ -262,31 +261,45 @@ class TestChatCompletionsPassthrough:
 
 
 class TestMessagesEndpoint:
-    EXPECTED: ClassVar[dict] = {
-        "error": {
-            "type": "invalid_request_error",
-            "message": (
-                "This proxy serves a single OpenAI-compatible provider via "
-                "/v1/chat/completions and /v1/responses; /messages is not supported."
-            ),
-        }
-    }
+    def test_documented_messages_model_relays_to_go(self, server):
+        port, _ = server
+        upstream_body = b'{"id":"msg_1","content":[]}'
+        captured = []
 
-    def test_post_v1_messages_returns_400(self, server):
+        def fake_urlopen(request, **kwargs):
+            captured.append(request)
+            return MockUpstreamResponse(upstream_body)
+
+        with mock.patch(
+            "opencode_go_proxy.go_upstream.resolve_api_key",
+            return_value="test-key",
+        ), mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            resp, raw = post(
+                port,
+                "/v1/messages",
+                b'{"model":"opencode-go/minimax-m3","messages":[]}',
+            )
+
+        assert resp.status == 200
+        assert raw == upstream_body
+        assert captured[0].full_url.endswith("/messages")
+        assert json.loads(captured[0].data)["model"] == "minimax-m3"
+
+    def test_unknown_messages_model_returns_400(self, server):
         port, _ = server
         resp, raw = post(port, "/v1/messages", b'{"model":"claude-sonnet-4"}')
 
         assert resp.status == 400
-        assert json.loads(raw) == self.EXPECTED
+        assert json.loads(raw)["error"]["type"] == "model_not_found"
 
-    def test_post_messages_alias_returns_400(self, server):
+    def test_chat_model_on_messages_alias_returns_400(self, server):
         port, _ = server
         resp, raw = post(port, "/messages", b"{}")
 
         assert resp.status == 400
-        assert json.loads(raw) == self.EXPECTED
+        assert json.loads(raw)["error"]["type"] == "invalid_request_error"
 
-    def test_get_messages_returns_400(self, server):
+    def test_get_messages_returns_405(self, server):
         port, _ = server
         conn = HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request("GET", "/v1/messages")
@@ -294,8 +307,8 @@ class TestMessagesEndpoint:
         raw = resp.read()
         conn.close()
 
-        assert resp.status == 400
-        assert json.loads(raw) == self.EXPECTED
+        assert resp.status == 405
+        assert "error" in json.loads(raw)
 
 
 class TestWebSocketUpgradeRejection:
@@ -360,6 +373,7 @@ class TestPassthroughMetering:
             from opencode_go_proxy.meter import usage_events_path
 
             handler = mock.Mock(wfile=mock.Mock())
+            handler.headers = {}
             handle_chat_completions_request(handler, {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}, make_config(8790), "req")
             with open(usage_events_path()) as fh:
                 events = [json.loads(line) for line in fh if line.strip()]

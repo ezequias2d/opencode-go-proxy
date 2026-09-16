@@ -46,43 +46,42 @@ def _request_header(request, name: str) -> str | None:
 class DiscoverModelsTests(unittest.TestCase):
     def test_discover_models_returns_only_opencode_entries(self) -> None:
         payload = {
-            "opencode": {
-                "models": {
-                    "gpt-5.5": {"id": "gpt-5.5", "name": "GPT-5.5", "reasoning": True},
-                    "deepseek-v4-flash": {
-                        "id": "deepseek-v4-flash",
-                        "name": "DeepSeek V4 Flash",
-                        "limit": {"context": 400000},
-                    },
-                }
-            },
-            "other-provider": {
-                "models": {
-                    "some-model": {"id": "some-model", "name": "Some Model"},
-                }
-            },
+            "data": [
+                {"id": "grok-4.6", "name": "Grok 4.6"},
+                {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"},
+                {"id": "some-model", "name": "Some Model"},
+            ]
         }
         seen: dict = {}
 
         def capture(request, *args, **kwargs):
             seen["url"] = request.full_url
             seen["ua"] = request.headers.get("User-agent")
+            seen["authorization"] = request.headers.get("Authorization")
             seen["if_none_match"] = _request_header(request, "If-None-Match")
-            return FakeResponse(payload, headers={"ETag": 'W/"models-dev-v42"'})
+            return FakeResponse(payload, headers={"ETag": 'W/"go-v42"'})
 
-        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=capture):
+        with mock.patch(
+            "opencode_go_proxy.catalog.resolve_api_key",
+            return_value="catalog-key",
+        ), mock.patch(
+            "opencode_go_proxy.catalog.urllib.request.urlopen",
+            side_effect=capture,
+        ):
             models, etag = discover_models()
 
-        self.assertEqual([m["id"] for m in models], ["gpt-5.5", "deepseek-v4-flash"])
+        self.assertEqual(
+            [m["id"] for m in models],
+            ["grok-4.6", "deepseek-v4-flash"],
+        )
         self.assertNotIn("some-model", {m["id"] for m in models})
-        # models.dev rejects the default urllib UA with 403; the discovery
-        # fetch must carry an identifying UA.
-        self.assertEqual(seen["url"], "https://models.dev/api.json")
+        self.assertEqual(seen["url"], "https://opencode.ai/zen/go/v1/models")
         self.assertTrue(seen["ua"].startswith("opencode-go-proxy/"))
+        self.assertEqual(seen["authorization"], "Bearer catalog-key")
         # No stored etag on a first fetch: no conditional header is sent, and
         # the response ETag flows back for the caller to store.
         self.assertIsNone(seen["if_none_match"])
-        self.assertEqual(etag, 'W/"models-dev-v42"')
+        self.assertEqual(etag, 'W/"go-v42"')
 
     def test_discover_models_sends_if_none_match_and_raises_on_304(self) -> None:
         seen: dict = {}

@@ -293,7 +293,7 @@ class ZenMergedCatalogTests(unittest.TestCase):
         self.assertEqual(len(zen_entries), 6)
         slugs = {str(m["slug"]) for m in merged["models"]}
         self.assertIn("zen/claude-sonnet-4-5", slugs)
-        self.assertIn("deepseek-v4-flash", slugs)  # go entry still present
+        self.assertIn("opencode-go/deepseek-v4-flash", slugs)
 
         record = next(m for m in zen_entries if m["slug"] == "zen/claude-sonnet-4-5")
         self.assertEqual(record["family"], "anthropic_messages")
@@ -311,23 +311,6 @@ class ZenMergedCatalogTests(unittest.TestCase):
 
         record = next(m for m in merged["models"] if m["slug"] == "zen/deepseek-v4-flash")
         self.assertEqual(record["display_name"], "deepseek-v4-flash (Zen)")
-
-    def test_zen_display_name_suffixed_when_go_record_shares_display_name(self) -> None:
-        _seed_zen_cache(ZEN_PAYLOAD["data"])
-        compact = {
-            "fetched_at": "2026-08-14T00:00:00Z",
-            "etag": "",
-            "client_version": "0.147.0",
-            "shared_instructions": "",
-            "models": [{"slug": "some-go-model", "display_name": "claude-sonnet-4-5"}],
-        }
-        with open(catalog.state_compact_path(), "w") as handle:
-            json.dump(compact, handle)
-
-        merged = catalog.render_merged_catalog()
-
-        record = next(m for m in merged["models"] if m["slug"] == "zen/claude-sonnet-4-5")
-        self.assertEqual(record["display_name"], "claude-sonnet-4-5 (Zen)")
 
     def test_zen_only_record_keeps_plain_display_name(self) -> None:
         # claude-sonnet-4-5 has no opencode-go counterpart in the seed

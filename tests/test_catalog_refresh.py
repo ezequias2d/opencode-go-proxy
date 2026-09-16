@@ -45,7 +45,7 @@ def make_compact(fetched_at: str) -> dict:
         "client_version": "0.147.0",
         "models": [
             {
-                "slug": "existing-model",
+                "slug": "deepseek-v4-flash",
                 "display_name": "Existing Model",
                 "description": "Already known.",
                 "default_reasoning_level": "medium",
@@ -85,6 +85,14 @@ class RefreshCatalogTests(unittest.TestCase):
         self.compact_path = os.path.join(self.tmp, "models.json")
         self.catalog_path = os.path.join(self.tmp, "catalog.json")
         self.now = datetime.datetime(2026, 8, 10, 12, 0, 0, tzinfo=datetime.UTC)
+        self.env = mock.patch.dict(
+            os.environ,
+            {"OPENCODE_GO_API_KEY": "catalog-test-key"},
+        )
+        self.env.start()
+
+    def tearDown(self) -> None:
+        self.env.stop()
 
     def _write_compact(self, fetched_at: str) -> None:
         with open(self.compact_path, "w") as f:
@@ -103,7 +111,7 @@ class RefreshCatalogTests(unittest.TestCase):
                 now=self.now,
             )
 
-        self.assertEqual(rendered["models"][0]["slug"], "existing-model")
+        self.assertEqual(rendered["models"][0]["slug"], "deepseek-v4-flash")
         with open(self.compact_path) as f:
             compact = json.load(f)
         self.assertNotEqual(compact["fetched_at"], self.now.isoformat())
@@ -113,7 +121,7 @@ class RefreshCatalogTests(unittest.TestCase):
         self._write_compact((self.now - datetime.timedelta(hours=25)).isoformat())
         discovered = [
             {
-                "id": "new-model",
+                "id": "glm-5.3",
                 "name": "New Model",
                 "description": "Freshly discovered.",
                 "limit": {"context": 200000},
@@ -128,11 +136,14 @@ class RefreshCatalogTests(unittest.TestCase):
                 now=self.now,
             )
 
-        self.assertEqual([m["slug"] for m in rendered["models"]], ["existing-model", "new-model"])
+        self.assertEqual(
+            [m["slug"] for m in rendered["models"]],
+            ["deepseek-v4-flash", "glm-5.3"],
+        )
         with open(self.compact_path) as f:
             compact = json.load(f)
         self.assertEqual(compact["fetched_at"], self.now.isoformat())
-        self.assertEqual(compact["models"][1]["slug"], "new-model")
+        self.assertEqual(compact["models"][1]["slug"], "glm-5.3")
 
     def test_force_refreshes_fresh_compact(self) -> None:
         self._write_compact((self.now - datetime.timedelta(hours=1)).isoformat())
@@ -148,7 +159,7 @@ class RefreshCatalogTests(unittest.TestCase):
         with open(self.compact_path) as f:
             compact = json.load(f)
         self.assertEqual(compact["fetched_at"], self.now.isoformat())
-        self.assertEqual(rendered["models"][0]["slug"], "existing-model")
+        self.assertEqual(rendered["models"][0]["slug"], "deepseek-v4-flash")
 
     def test_refresh_disabled_by_env(self) -> None:
         self._write_compact((self.now - datetime.timedelta(hours=25)).isoformat())
@@ -165,7 +176,7 @@ class RefreshCatalogTests(unittest.TestCase):
                 now=self.now,
             )
 
-        self.assertEqual(rendered["models"][0]["slug"], "existing-model")
+        self.assertEqual(rendered["models"][0]["slug"], "deepseek-v4-flash")
         with open(self.compact_path) as f:
             compact = json.load(f)
         self.assertNotEqual(compact["fetched_at"], self.now.isoformat())
@@ -183,7 +194,7 @@ class RefreshCatalogTests(unittest.TestCase):
                 now=self.now,
             )
 
-        self.assertEqual(rendered["models"][0]["slug"], "existing-model")
+        self.assertEqual(rendered["models"][0]["slug"], "deepseek-v4-flash")
         with open(self.compact_path) as f:
             compact = json.load(f)
         self.assertNotEqual(compact["fetched_at"], self.now.isoformat())
@@ -205,7 +216,7 @@ class RefreshCatalogTests(unittest.TestCase):
                 seed_path=seed_path,
                 now=self.now,
             )
-        self.assertEqual(rendered["models"][0]["slug"], "existing-model")
+        self.assertEqual(rendered["models"][0]["slug"], "deepseek-v4-flash")
         self.assertTrue(os.path.exists(self.catalog_path))
 
     def test_etag_is_stored_and_sent_as_if_none_match_on_next_refresh(self) -> None:
@@ -217,7 +228,7 @@ class RefreshCatalogTests(unittest.TestCase):
             if state["respond_304"]:
                 raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
             return _FakeResponse(
-                {"opencode": {"models": {"existing-model": {"id": "existing-model", "name": "Existing Model"}}}},
+                {"data": [{"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"}]},
                 headers={"ETag": 'W/"models-dev-v7"'},
             )
 
@@ -255,7 +266,7 @@ class RefreshCatalogTests(unittest.TestCase):
             if state["respond_304"]:
                 raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
             return _FakeResponse(
-                {"opencode": {"models": {"existing-model": {"id": "existing-model", "name": "Existing Model"}}}},
+                {"data": [{"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"}]},
                 headers={"ETag": 'W/"models-dev-v9"'},
             )
 
@@ -302,7 +313,7 @@ class RefreshCatalogTests(unittest.TestCase):
 
         def fake_urlopen(request, *args, **kwargs):
             return _FakeResponse(
-                {"opencode": {"models": {"existing-model": {"id": "existing-model", "name": "Existing Model"}}}}
+                {"data": [{"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"}]}
             )
 
         with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
@@ -333,7 +344,7 @@ class RefreshCatalogTests(unittest.TestCase):
 
         def fake_urlopen(request, *args, **kwargs):
             seen["if_none_match"] = _request_header(request, "If-None-Match")
-            return _FakeResponse({"opencode": {"models": {}}})
+            return _FakeResponse({"data": []})
 
         with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
             refresh_catalog(

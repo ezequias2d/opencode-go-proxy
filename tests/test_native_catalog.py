@@ -162,7 +162,7 @@ def test_merged_catalog_contains_native_and_opencode_go_entries() -> None:
     slugs = {m["slug"] for m in merged["models"]}
     assert "gpt-5.6-luna" in slugs  # native entry, captured slug
     assert "gpt-5.6-terra" in slugs
-    assert "deepseek-v4-flash" in slugs  # opencode-go entry, bare slug
+    assert "opencode-go/deepseek-v4-flash" in slugs
     luna = next(m for m in merged["models"] if m["slug"] == "gpt-5.6-luna")
     assert luna["multi_agent_version"] == "v1"
     assert luna["context_window"] == 272000
@@ -176,7 +176,7 @@ def test_merged_catalog_without_capture_is_opencode_go_only() -> None:
     merged = catalog.render_merged_catalog()
     slugs = {m["slug"] for m in merged["models"]}
     assert "gpt-5.6-luna" not in slugs
-    assert "deepseek-v4-flash" in slugs
+    assert "opencode-go/deepseek-v4-flash" in slugs
 
 
 def test_effort_clamp_drops_unknown_efforts() -> None:
@@ -189,8 +189,8 @@ def test_effort_clamp_drops_unknown_efforts() -> None:
         "client_version": "0.147.0",
         "models": [
             {
-                "slug": "clamp-me",
-                "display_name": "Clamp Me",
+                "slug": "deepseek-v4-flash",
+                "display_name": "DeepSeek V4 Flash",
                 "context_window": 100000,
                 "supported_reasoning_levels": [
                     {"effort": "low", "description": "ok"},
@@ -204,7 +204,9 @@ def test_effort_clamp_drops_unknown_efforts() -> None:
         json.dump(compact, handle)
     _seed_native_capture()  # effort vocabulary: low, medium, max, high, ultra
     merged = catalog.render_merged_catalog()
-    clamped = next(m for m in merged["models"] if m["slug"] == "clamp-me")
+    clamped = next(
+        m for m in merged["models"] if m["slug"] == "opencode-go/deepseek-v4-flash"
+    )
     efforts = [level["effort"] for level in clamped["supported_reasoning_levels"]]
     assert efforts == ["low", "medium"]
 
@@ -219,8 +221,8 @@ def test_effort_clamp_skipped_without_capture() -> None:
         "client_version": "0.147.0",
         "models": [
             {
-                "slug": "clamp-me",
-                "display_name": "Clamp Me",
+                "slug": "deepseek-v4-flash",
+                "display_name": "DeepSeek V4 Flash",
                 "supported_reasoning_levels": [{"effort": "ultra-super", "description": "x"}],
             }
         ],
@@ -228,5 +230,7 @@ def test_effort_clamp_skipped_without_capture() -> None:
     with open(os.path.join(state, catalog.STATE_COMPACT_NAME), "w") as handle:
         json.dump(compact, handle)
     merged = catalog.render_merged_catalog()
-    entry = next(m for m in merged["models"] if m["slug"] == "clamp-me")
+    entry = next(
+        m for m in merged["models"] if m["slug"] == "opencode-go/deepseek-v4-flash"
+    )
     assert [level["effort"] for level in entry["supported_reasoning_levels"]] == ["ultra-super"]

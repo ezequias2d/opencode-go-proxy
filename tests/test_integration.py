@@ -277,7 +277,7 @@ class TestStreamingResponse:
         assert "hel" in raw_text
         assert "lo" in raw_text
 
-    def test_streaming_missing_api_key_sends_error_event(self, server):
+    def test_streaming_missing_api_key_fails_before_sse(self, server):
         port, _ = server
         from opencode_go_proxy.secrets import clear_api_key_cache
         clear_api_key_cache()
@@ -293,15 +293,14 @@ class TestStreamingResponse:
             raw = resp.read()
             conn.close()
 
-        assert resp.status == 200
-        raw_text = raw.decode("utf-8")
-        assert "response.error" in raw_text
-        assert "[DONE]" in raw_text
+        assert resp.status == 401
+        body = json.loads(raw)
+        assert body["error"]["type"] == "proxy_error"
 
-    def test_streaming_crash_sends_sse_error(self, server):
+    def test_streaming_translation_crash_fails_before_sse(self, server):
         port, _ = server
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.streaming.responses_payload_to_chat_payload",
+            "opencode_go_proxy.zen_upstream.responses_payload_to_chat_payload",
             side_effect=ValueError("boom"),
         ):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
@@ -312,10 +311,9 @@ class TestStreamingResponse:
             raw = resp.read()
             conn.close()
 
-        assert resp.status == 200
-        raw_text = raw.decode("utf-8")
-        assert "response.error" in raw_text
-        assert "[DONE]" in raw_text
+        assert resp.status == 500
+        body = json.loads(raw)
+        assert body["error"]["type"] == "proxy_crash"
 
 
 class TestEdgeCases:

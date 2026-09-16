@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from http import HTTPStatus
 from typing import Any
 
@@ -54,6 +55,8 @@ from .protocol import (
     responses_input_to_chat_messages,
     responses_payload_to_chat_payload,
     responses_tools_to_chat_tools,
+    responses_tools_to_function_tools,
+    restore_namespaced_function_calls,
 )
 from .secrets import resolve_api_key
 from .streaming import _ConnectFailed, _open_upstream_stream, keepalive_sec
@@ -65,6 +68,8 @@ from .upstream import (
     retry_sleep,
     usage_tokens,
 )
+from .upstream_headers import upstream_user_agent
+from .vision import caption_images_in_messages
 from .zen_catalog import ZEN_PREFIX, resolve_family, zen_families, zen_model_ids
 
 Json = dict[str, Any]
@@ -128,13 +133,8 @@ def zen_family_for(bare_id: str) -> str:
     return "openai_chat"
 
 
-def _user_agent() -> str:
-    return os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0")
-
-
-def _zen_endpoint(family: str, bare_id: str, *, stream: bool) -> str:
-    """Per-family zen path for the bare model id."""
-    base = zen_base_url()
+def _family_endpoint(base: str, family: str, bare_id: str, *, stream: bool) -> str:
+    """Return the protocol-specific path below one OpenCode API base."""
     if family == "openai_responses":
         return f"{base}/responses"
     if family == "openai_chat":
@@ -147,14 +147,26 @@ def _zen_endpoint(family: str, bare_id: str, *, stream: bool) -> str:
     return f"{base}/models/{quoted}:generateContent"
 
 
-def _zen_headers(family: str, api_key: str, *, stream: bool) -> dict[str, str]:
-    """Per-family auth and accept headers."""
+def _zen_endpoint(family: str, bare_id: str, *, stream: bool) -> str:
+    """Per-family zen path for the bare model id."""
+    return _family_endpoint(zen_base_url(), family, bare_id, stream=stream)
+
+
+def _family_headers(
+    family: str,
+    api_key: str,
+    *,
+    stream: bool,
+    extra_headers: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Per-family auth, identity, affinity, and accept headers."""
     accept = "text/event-stream" if stream else "application/json"
     headers = {
         "content-type": "application/json",
         "accept": accept,
-        "user-agent": _user_agent(),
+        "user-agent": upstream_user_agent(),
     }
+    headers.update(extra_headers or {})
     if family == "anthropic_messages":
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = ANTHROPIC_VERSION
@@ -163,6 +175,11 @@ def _zen_headers(family: str, api_key: str, *, stream: bool) -> dict[str, str]:
     else:
         headers["authorization"] = f"Bearer {api_key}"
     return headers
+
+
+def _zen_headers(family: str, api_key: str, *, stream: bool) -> dict[str, str]:
+    """Per-family auth and accept headers."""
+    return _family_headers(family, api_key, stream=stream)
 
 
 def parse_zen_error(body: str) -> tuple[str | None, str | None]:
@@ -191,7 +208,7 @@ def parse_zen_error(body: str) -> tuple[str | None, str | None]:
     return None, message if isinstance(message, str) else None
 
 
-def _build_zen_request(
+def _build_family_request(
     payload: Json,
     family: str,
     bare_id: str,
@@ -199,8 +216,14 @@ def _build_zen_request(
     *,
     stream: bool,
     session_model: str,
+    base_url: str,
+    extra_headers: Mapping[str, str] | None = None,
+    function_tools_only: bool = False,
+    caption_images: bool = False,
+    config: ProxyConfig | None = None,
+    request_id: str | None = None,
 ) -> tuple[str, Json, dict[str, str]]:
-    """Return ``(url, body, headers)`` for one zen upstream call.
+    """Return ``(url, body, headers)`` for one family-aware upstream call.
 
     ``session_model`` is the prefixed slug the app knows; the wire body always
     addresses the upstream with the bare id. Translated families get the
@@ -211,13 +234,43 @@ def _build_zen_request(
     if family == "openai_responses":
         working = dict(payload)
         working["model"] = bare_id
-        url = _zen_endpoint(family, bare_id, stream=stream)
-        return url, working, _zen_headers(family, api_key, stream=stream)
+        if function_tools_only and "tools" in working:
+            tools, _stats = responses_tools_to_function_tools(working.get("tools"))
+            if tools is None:
+                working.pop("tools", None)
+                working.pop("tool_choice", None)
+            else:
+                working["tools"] = tools
+                tool_choice = working.get("tool_choice")
+                if isinstance(tool_choice, dict):
+                    name = tool_choice.get("name")
+                    namespace = tool_choice.get("namespace")
+                    if isinstance(name, str) and name:
+                        if isinstance(namespace, str) and namespace:
+                            name = f"{namespace}__{name}"
+                        working["tool_choice"] = {"type": "function", "name": name}
+        url = _family_endpoint(base_url, family, bare_id, stream=stream)
+        return url, working, _family_headers(
+            family, api_key, stream=stream, extra_headers=extra_headers
+        )
 
     if family == "openai_chat":
         working = inject_session_model(dict(payload), session_model)
         working["model"] = bare_id
-        chat_payload, _request_model, _stats = responses_payload_to_chat_payload(working)
+        chat_payload, _request_model, stats = responses_payload_to_chat_payload(working)
+        if (
+            caption_images
+            and stats.get("has_image")
+            and stats.get("tools_present")
+            and config is not None
+            and request_id is not None
+        ):
+            chat_payload = caption_images_in_messages(
+                chat_payload,
+                bare_id,
+                config,
+                request_id,
+            )
         # The catalog translation can rewrite the model (image fallback /
         # unknown slug); the zen upstream is addressed with the bare zen id,
         # never a substitute.
@@ -227,21 +280,49 @@ def _build_zen_request(
             chat_payload["stream_options"] = {"include_usage": True}
         else:
             chat_payload["stream"] = False
-        url = _zen_endpoint(family, bare_id, stream=stream)
-        return url, chat_payload, _zen_headers(family, api_key, stream=stream)
+        url = _family_endpoint(base_url, family, bare_id, stream=stream)
+        return url, chat_payload, _family_headers(
+            family, api_key, stream=stream, extra_headers=extra_headers
+        )
 
     if family == "anthropic_messages":
         working = inject_session_model(dict(payload), session_model)
         working["model"] = bare_id
         body = responses_payload_to_anthropic_payload(working)
+        body["model"] = bare_id
         body["stream"] = stream
-        url = _zen_endpoint(family, bare_id, stream=stream)
-        return url, body, _zen_headers(family, api_key, stream=stream)
+        url = _family_endpoint(base_url, family, bare_id, stream=stream)
+        return url, body, _family_headers(
+            family, api_key, stream=stream, extra_headers=extra_headers
+        )
 
     working = inject_session_model(dict(payload), session_model)
     body = responses_payload_to_gemini_payload(working)
-    url = _zen_endpoint(family, bare_id, stream=stream)
-    return url, body, _zen_headers(family, api_key, stream=stream)
+    url = _family_endpoint(base_url, family, bare_id, stream=stream)
+    return url, body, _family_headers(
+        family, api_key, stream=stream, extra_headers=extra_headers
+    )
+
+
+def _build_zen_request(
+    payload: Json,
+    family: str,
+    bare_id: str,
+    api_key: str,
+    *,
+    stream: bool,
+    session_model: str,
+) -> tuple[str, Json, dict[str, str]]:
+    """Return ``(url, body, headers)`` for one zen upstream call."""
+    return _build_family_request(
+        payload,
+        family,
+        bare_id,
+        api_key,
+        stream=stream,
+        session_model=session_model,
+        base_url=zen_base_url(),
+    )
 
 
 def _zen_post(
@@ -252,6 +333,7 @@ def _zen_post(
     request_id: str,
     *,
     max_retries: int | None = None,
+    provider: str = ZEN_PROVIDER,
 ) -> tuple[Json, int]:
     """POST one JSON zen request with the shared retry policy.
 
@@ -264,26 +346,26 @@ def _zen_post(
     retries = 0
     while True:
         request = urllib.request.Request(url, data=raw_payload, headers=headers, method="POST")
-        trace("zen.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
+        trace(f"{provider}.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
         started = time.time()
         try:
             with urllib.request.urlopen(request, timeout=config.timeout_sec) as response:
                 body = response.read()
                 elapsed_ms = int((time.time() - started) * 1000)
-                trace("zen.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
+                trace(f"{provider}.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
                 try:
                     value = json.loads(body)
                 except json.JSONDecodeError:
-                    raise ProxyError(HTTPStatus.BAD_GATEWAY, "zen upstream returned invalid JSON", retries=retries)
+                    raise ProxyError(HTTPStatus.BAD_GATEWAY, f"{provider} upstream returned invalid JSON", retries=retries)
                 if not isinstance(value, dict):
-                    raise ProxyError(HTTPStatus.BAD_GATEWAY, "zen upstream returned non-object JSON", retries=retries)
+                    raise ProxyError(HTTPStatus.BAD_GATEWAY, f"{provider} upstream returned non-object JSON", retries=retries)
                 return value, retries
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            trace("zen.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
+            trace(f"{provider}.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
             if retriable_http_status(exc.code) and retries < max_retries:
                 retries += 1
-                trace("zen.retry", request_id=request_id, attempt=retries, status=exc.code)
+                trace(f"{provider}.retry", request_id=request_id, attempt=retries, status=exc.code)
                 retry_sleep(retries)
                 continue
             error_type, message = parse_zen_error(body)
@@ -295,6 +377,10 @@ def _zen_post(
                     retries=retries,
                     upstream_status=exc.code,
                     error_type=error_type,
+                    headers={
+                        key.lower(): value for key, value in (exc.headers or {}).items()
+                    },
+                    body=body,
                 ) from exc
             try:
                 status = HTTPStatus(exc.code)
@@ -302,27 +388,31 @@ def _zen_post(
                 status = HTTPStatus.BAD_GATEWAY
             raise ProxyError(
                 status,
-                message or f"zen upstream HTTP {exc.code}",
+                message or f"{provider} upstream HTTP {exc.code}",
                 retries=retries,
                 upstream_status=exc.code,
                 error_type=error_type,
+                headers={
+                    key.lower(): value for key, value in (exc.headers or {}).items()
+                },
+                body=body,
             ) from exc
         except urllib.error.URLError as exc:
-            trace("zen.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            trace(f"{provider}.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:
                 retries += 1
-                trace("zen.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
+                trace(f"{provider}.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
                 retry_sleep(retries)
                 continue
-            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"zen upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"{provider} upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
         except TimeoutError:
-            trace("zen.timeout", request_id=request_id, timeout=config.timeout_sec)
+            trace(f"{provider}.timeout", request_id=request_id, timeout=config.timeout_sec)
             if retries < max_retries:
                 retries += 1
-                trace("zen.retry", request_id=request_id, attempt=retries, reason="timeout")
+                trace(f"{provider}.retry", request_id=request_id, attempt=retries, reason="timeout")
                 retry_sleep(retries)
                 continue
-            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "zen upstream timeout", retries=retries) from None
+            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, f"{provider} upstream timeout", retries=retries) from None
 
 
 def _zen_post_verbatim(
@@ -851,11 +941,12 @@ def _translate_response(value: Json, family: str, model: str) -> Json:
     return _gemini_to_response(value, model)
 
 
-def _meter_zen(
+def _meter_provider(
     model: str,
     started: float,
     status: int,
     *,
+    provider: str,
     input_tokens: Any = None,
     output_tokens: Any = None,
     total_tokens: Any = None,
@@ -864,8 +955,7 @@ def _meter_zen(
     empty_completion: bool = False,
     retries: int | None = None,
 ) -> None:
-    """Append one usage event with the zen provider so zen turns never count
-    against the opencode-go quota."""
+    """Append one usage event under the credential-owning provider."""
     record_usage_event(
         model=model,
         status=status,
@@ -877,7 +967,23 @@ def _meter_zen(
         stream_aborted=stream_aborted,
         empty_completion=empty_completion,
         retries=retries,
+        provider=provider,
+    )
+
+
+def _meter_zen(
+    model: str,
+    started: float,
+    status: int,
+    **fields: Any,
+) -> None:
+    """Append one usage event under the Zen provider."""
+    _meter_provider(
+        model,
+        started,
+        status,
         provider=ZEN_PROVIDER,
+        **fields,
     )
 
 
@@ -913,42 +1019,108 @@ def _relay_upstream_error(
     handler.wfile.flush()
 
 
-def call_zen_responses(payload: Json, config: ProxyConfig, request_id: str) -> Json:
-    """Non-stream Responses call: translate per family and return the response.
-
-    Metering is provider="zen" on success and on every ProxyError path; the
-    error is re-raised for the dispatcher to render.
-    """
+def call_family_responses(
+    payload: Json,
+    config: ProxyConfig,
+    request_id: str,
+    *,
+    model: str,
+    bare_id: str,
+    family: str,
+    api_key: str,
+    base_url: str,
+    provider: str,
+    extra_headers: Mapping[str, str] | None = None,
+    function_tools_only: bool = False,
+    restore_namespaces: bool = False,
+    caption_images: bool = False,
+) -> Json:
+    """Non-stream Responses call through one certified protocol family."""
     started = time.time()
-    model = payload.get("model") or DEFAULT_MODEL
-    bare_id = bare_zen_id(model)
-    family = zen_family_for(bare_id)
-    api_key = resolve_api_key(config, request_id)
-    url, body, headers = _build_zen_request(
-        payload, family, bare_id, api_key, stream=False, session_model=model
+    url, body, headers = _build_family_request(
+        payload,
+        family,
+        bare_id,
+        api_key,
+        stream=False,
+        session_model=model,
+        base_url=base_url,
+        extra_headers=extra_headers,
+        function_tools_only=function_tools_only,
+        caption_images=caption_images,
+        config=config,
+        request_id=request_id,
     )
     raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    trace("zen.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=False)
+    trace(f"{provider}.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=False)
     try:
-        value, retries = _zen_post(url, raw_payload, headers, config, request_id)
+        value, retries = _zen_post(
+            url, raw_payload, headers, config, request_id, provider=provider
+        )
     except ProxyError as exc:
-        _meter_zen(model, started, int(exc.status), retries=exc.retries or None)
+        status = (
+            HTTPStatus.BAD_GATEWAY
+            if exc.upstream_status is not None
+            and exc.upstream_status >= HTTPStatus.INTERNAL_SERVER_ERROR
+            else exc.status
+        )
+        _meter_provider(
+            model,
+            started,
+            int(status),
+            provider=provider,
+            retries=exc.retries or None,
+        )
+        if (
+            exc.upstream_status is not None
+            and exc.upstream_status >= HTTPStatus.INTERNAL_SERVER_ERROR
+        ):
+            raise ProxyError(
+                HTTPStatus.BAD_GATEWAY,
+                f"{provider} upstream HTTP {exc.upstream_status}: {exc.message}",
+                retries=exc.retries,
+                upstream_status=exc.upstream_status,
+                headers=exc.headers,
+                body=exc.body,
+            ) from exc
         raise
     if family == "openai_chat":
         record_cache(config.cache_tracker, body.get("model"), value.get("usage"))
     inp, outp, total = _zen_tokens(value, family)
-    _meter_zen(
-        model, started, 200,
+    _meter_provider(
+        model,
+        started,
+        200,
+        provider=provider,
         input_tokens=inp, output_tokens=outp, total_tokens=total,
         retries=retries or None,
     )
     response = _translate_response(value, family, model)
+    if restore_namespaces:
+        response = restore_namespaced_function_calls(response)
     trace(
-        "zen.done", request_id=request_id, family=family, stream=False,
+        f"{provider}.done", request_id=request_id, family=family, stream=False,
         output_items=len(response.get("output", [])),
         output_text_len=len(response.get("output_text", "")),
     )
     return response
+
+
+def call_zen_responses(payload: Json, config: ProxyConfig, request_id: str) -> Json:
+    """Non-stream Responses call through the routed Zen family."""
+    model = payload.get("model") or DEFAULT_MODEL
+    bare_id = bare_zen_id(model)
+    return call_family_responses(
+        payload,
+        config,
+        request_id,
+        model=model,
+        bare_id=bare_id,
+        family=zen_family_for(bare_id),
+        api_key=resolve_api_key(config, request_id),
+        base_url=zen_base_url(),
+        provider=ZEN_PROVIDER,
+    )
 
 
 class _ZenStreamEngine:
@@ -973,6 +1145,7 @@ class _ZenStreamEngine:
         response_id: str,
         started: float,
         raw_payload: bytes,
+        provider: str = ZEN_PROVIDER,
     ) -> None:
         self.handler = handler
         self.config = config
@@ -983,6 +1156,7 @@ class _ZenStreamEngine:
         self.response_id = response_id
         self.started = started
         self.raw_payload = raw_payload
+        self.provider = provider
         self.retries = 0
 
         self.client_alive = True
@@ -1250,27 +1424,62 @@ class _ZenStreamEngine:
         self.next_output_index = 0
         self._active_tool_index = None
 
-    def run_attempt(self, req: urllib.request.Request) -> str:
+    def run_attempt(
+        self,
+        req: urllib.request.Request,
+        response: Any | None = None,
+        retries: int = 0,
+    ) -> str:
         """Connect, stream, translate; returns 'content', 'empty', 'nodata', 'gone', or 'error'."""
-        try:
-            response, attempts = _open_upstream_stream(req, self.config, self.request_id, default_max_retries())
-            self.retries += attempts
-        except _ConnectFailed as fail:
-            self.retries += fail.attempts
-            exc = fail.exc
-            if isinstance(exc, urllib.error.HTTPError):
-                _relay_upstream_error(self.handler, exc.code, fail.body, exc.headers)
-                _meter_zen(self.model, self.started, exc.code, retries=self.retries or None)
-                return "error"
-            if isinstance(exc, TimeoutError):
-                _meter_zen(self.model, self.started, int(HTTPStatus.GATEWAY_TIMEOUT), retries=self.retries or None)
-                raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "zen upstream timeout", retries=self.retries) from exc
-            _meter_zen(self.model, self.started, int(HTTPStatus.BAD_GATEWAY), retries=self.retries or None)
-            raise ProxyError(
-                HTTPStatus.BAD_GATEWAY,
-                f"zen upstream network error: {getattr(exc, 'reason', exc)}",
-                retries=self.retries,
-            ) from exc
+        if response is None:
+            try:
+                response, attempts = _open_upstream_stream(
+                    req,
+                    self.config,
+                    self.request_id,
+                    default_max_retries(),
+                )
+                self.retries += attempts
+            except _ConnectFailed as fail:
+                self.retries += fail.attempts
+                exc = fail.exc
+                if isinstance(exc, urllib.error.HTTPError):
+                    _relay_upstream_error(self.handler, exc.code, fail.body, exc.headers)
+                    _meter_provider(
+                        self.model,
+                        self.started,
+                        exc.code,
+                        provider=self.provider,
+                        retries=self.retries or None,
+                    )
+                    return "error"
+                if isinstance(exc, TimeoutError):
+                    _meter_provider(
+                        self.model,
+                        self.started,
+                        int(HTTPStatus.GATEWAY_TIMEOUT),
+                        provider=self.provider,
+                        retries=self.retries or None,
+                    )
+                    raise ProxyError(
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                        f"{self.provider} upstream timeout",
+                        retries=self.retries,
+                    ) from exc
+                _meter_provider(
+                    self.model,
+                    self.started,
+                    int(HTTPStatus.BAD_GATEWAY),
+                    provider=self.provider,
+                    retries=self.retries or None,
+                )
+                raise ProxyError(
+                    HTTPStatus.BAD_GATEWAY,
+                    f"{self.provider} upstream network error: {getattr(exc, 'reason', exc)}",
+                    retries=self.retries,
+                ) from exc
+        else:
+            self.retries += retries
 
         try:
             with response as resp:
@@ -1292,21 +1501,45 @@ class _ZenStreamEngine:
                         self.handle_chunk(chunk)
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
             trace(
-                "zen.stream_aborted",
+                f"{self.provider}.stream_aborted",
                 request_id=self.request_id,
                 status=exc.code if isinstance(exc, urllib.error.HTTPError) else getattr(exc, "reason", str(exc)),
             )
-            self.send_error("zen upstream stream aborted")
-            _meter_zen(self.model, self.started, 502, stream_aborted=True, retries=self.retries or None)
+            self.send_error(f"{self.provider} upstream stream aborted")
+            _meter_provider(
+                self.model,
+                self.started,
+                502,
+                provider=self.provider,
+                stream_aborted=True,
+                retries=self.retries or None,
+            )
             return "error"
 
         if not self.client_alive:
-            trace("zen.client_gone", request_id=self.request_id, message="client disconnected before final events")
-            _meter_zen(self.model, self.started, 0, stream_aborted=True, retries=self.retries or None)
+            trace(
+                f"{self.provider}.client_gone",
+                request_id=self.request_id,
+                message="client disconnected before final events",
+            )
+            _meter_provider(
+                self.model,
+                self.started,
+                0,
+                provider=self.provider,
+                stream_aborted=True,
+                retries=self.retries or None,
+            )
             return "gone"
         if not self.got_data:
-            self.send_error("zen upstream returned no SSE data")
-            _meter_zen(self.model, self.started, 502, retries=self.retries or None)
+            self.send_error(f"{self.provider} upstream returned no SSE data")
+            _meter_provider(
+                self.model,
+                self.started,
+                502,
+                provider=self.provider,
+                retries=self.retries or None,
+            )
             return "nodata"
         if not self.text and not self.tool_calls and not self.reasoning:
             return "empty"
@@ -1378,18 +1611,26 @@ class _ZenStreamEngine:
         self._write(b"data: [DONE]\n\n")
         if self.family == "openai_chat":
             record_cache(self.config.cache_tracker, self.bare_id, self.usage)
-        _meter_zen(
-            self.model, self.started, 200,
+        _meter_provider(
+            self.model,
+            self.started,
+            200,
+            provider=self.provider,
             input_tokens=inp, output_tokens=outp, total_tokens=total,
             estimated_input_tokens=estimated,
             retries=self.retries or None,
         )
         trace(
-            "zen.done", request_id=self.request_id, family=self.family, stream=True,
+            f"{self.provider}.done", request_id=self.request_id, family=self.family, stream=True,
             output_items=len(output), output_text_len=len(self.text),
         )
 
-    def run(self, req: urllib.request.Request) -> None:
+    def run(
+        self,
+        req: urllib.request.Request,
+        initial_response: Any | None = None,
+        initial_retries: int = 0,
+    ) -> None:
         self.send_event(
             {
                 "type": "response.created",
@@ -1406,8 +1647,12 @@ class _ZenStreamEngine:
             }
         )
         empty_attempts = 0
+        response = initial_response
+        retries = initial_retries
         while True:
-            outcome = self.run_attempt(req)
+            outcome = self.run_attempt(req, response, retries)
+            response = None
+            retries = 0
             if outcome in ("error", "gone", "nodata"):
                 return
             if outcome == "empty":
@@ -1416,27 +1661,12 @@ class _ZenStreamEngine:
                     # A streamed 200 with no output is retried once with the
                     # identical request; response and item ids are reused.
                     self._reset_accumulation()
-                    try:
-                        _response, more = _open_upstream_stream(req, self.config, self.request_id, default_max_retries())
-                        self.retries += more
-                    except _ConnectFailed as fail:
-                        self.retries += fail.attempts
-                        exc = fail.exc
-                        if isinstance(exc, urllib.error.HTTPError):
-                            _relay_upstream_error(self.handler, exc.code, fail.body, exc.headers)
-                            _meter_zen(self.model, self.started, exc.code, retries=self.retries or None)
-                            return
-                        if isinstance(exc, TimeoutError):
-                            _meter_zen(self.model, self.started, int(HTTPStatus.GATEWAY_TIMEOUT), retries=self.retries or None)
-                            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "zen upstream timeout", retries=self.retries) from exc
-                        _meter_zen(self.model, self.started, int(HTTPStatus.BAD_GATEWAY), retries=self.retries or None)
-                        raise ProxyError(
-                            HTTPStatus.BAD_GATEWAY,
-                            f"zen upstream network error: {getattr(exc, 'reason', exc)}",
-                            retries=self.retries,
-                        ) from exc
+                    self.retries += 1
                     continue
-                self.send_error("zen upstream returned an empty completion", code="empty_completion")
+                self.send_error(
+                    f"{self.provider} upstream returned an empty completion",
+                    code="empty_completion",
+                )
                 inp, outp, total = self._tokens()
                 if isinstance(inp, int) and inp > 0:
                     note_real_input_tokens(self.model)
@@ -1444,8 +1674,11 @@ class _ZenStreamEngine:
                 estimated = estimate_input_tokens(self.model, len(self.raw_payload), self.usage, context_window=context_cap)
                 # The client-visible outcome is response.error empty_completion,
                 # so the meter records 502 (a failed turn), never a success.
-                _meter_zen(
-                    self.model, self.started, 502,
+                _meter_provider(
+                    self.model,
+                    self.started,
+                    502,
+                    provider=self.provider,
                     input_tokens=inp, output_tokens=outp, total_tokens=total,
                     estimated_input_tokens=estimated,
                     empty_completion=True, retries=self.retries or None,
@@ -1454,34 +1687,79 @@ class _ZenStreamEngine:
             return
 
 
-def handle_zen_responses_request(handler: Any, payload: Json, config: ProxyConfig, request_id: str) -> None:
-    """Serve a /v1/responses request for a zen-routed model (stream and non-stream).
+def _restore_responses_sse_line(line: bytes) -> bytes:
+    prefix = b"data:"
+    if not line.startswith(prefix):
+        return line
+    raw = line[len(prefix):].strip()
+    if not raw or raw == b"[DONE]":
+        return line
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return line
+    restored = restore_namespaced_function_calls(event)
+    return b"data: " + json.dumps(restored, separators=(",", ":")).encode() + b"\n"
 
-    The zen path owns the whole HTTP response: connect-first, so an upstream
-    non-200 is answered with the upstream's own status and body before any SSE
-    is committed. Streaming is per-family translated back to Responses events;
-    the openai_responses family is relayed verbatim. Metering is provider="zen"
-    on every outcome (success, upstream error, network error, client gone).
-    """
+
+def handle_family_responses_request(
+    handler: Any,
+    payload: Json,
+    config: ProxyConfig,
+    request_id: str,
+    *,
+    model: str,
+    bare_id: str,
+    family: str,
+    api_key: str,
+    base_url: str,
+    provider: str,
+    extra_headers: Mapping[str, str] | None = None,
+    function_tools_only: bool = False,
+    restore_namespaces: bool = False,
+    caption_images: bool = False,
+) -> None:
+    """Serve a Responses request through one certified upstream family."""
     started = time.time()
-    model = payload.get("model") or DEFAULT_MODEL
-    ensure_zen_slug(model)
-    bare_id = bare_zen_id(model)
-    family = zen_family_for(bare_id)
 
     if payload.get("stream") is not True:
-        # call_zen_responses meters provider="zen" on success and on every
-        # ProxyError path, then re-raises for the dispatcher to render.
-        _send_json(handler, call_zen_responses(payload, config, request_id))
+        _send_json(
+            handler,
+            call_family_responses(
+                payload,
+                config,
+                request_id,
+                model=model,
+                bare_id=bare_id,
+                family=family,
+                api_key=api_key,
+                base_url=base_url,
+                provider=provider,
+                extra_headers=extra_headers,
+                function_tools_only=function_tools_only,
+                restore_namespaces=restore_namespaces,
+                caption_images=caption_images,
+            ),
+        )
         return
 
-    api_key = resolve_api_key(config, request_id)
-    url, body, headers = _build_zen_request(
-        payload, family, bare_id, api_key, stream=True, session_model=model
+    url, body, headers = _build_family_request(
+        payload,
+        family,
+        bare_id,
+        api_key,
+        stream=True,
+        session_model=model,
+        base_url=base_url,
+        extra_headers=extra_headers,
+        function_tools_only=function_tools_only,
+        caption_images=caption_images,
+        config=config,
+        request_id=request_id,
     )
     raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
     req = urllib.request.Request(url, data=raw_payload, headers=headers, method="POST")
-    trace("zen.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=True)
+    trace(f"{provider}.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=True)
     try:
         response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
     except _ConnectFailed as fail:
@@ -1489,16 +1767,27 @@ def handle_zen_responses_request(handler: Any, payload: Json, config: ProxyConfi
         exc = fail.exc
         if isinstance(exc, urllib.error.HTTPError):
             _relay_upstream_error(handler, exc.code, fail.body, exc.headers)
-            _meter_zen(model, started, exc.code, retries=retries or None)
+            _meter_provider(
+                model, started, exc.code, provider=provider, retries=retries or None
+            )
             return
-        _meter_zen(
+        _meter_provider(
             model, started,
             int(HTTPStatus.GATEWAY_TIMEOUT if isinstance(exc, TimeoutError) else HTTPStatus.BAD_GATEWAY),
+            provider=provider,
             retries=retries or None,
         )
         if isinstance(exc, TimeoutError):
-            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "zen upstream timeout", retries=retries) from exc
-        raise ProxyError(HTTPStatus.BAD_GATEWAY, f"zen upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
+            raise ProxyError(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                f"{provider} upstream timeout",
+                retries=retries,
+            ) from exc
+        raise ProxyError(
+            HTTPStatus.BAD_GATEWAY,
+            f"{provider} upstream network error: {getattr(exc, 'reason', exc)}",
+            retries=retries,
+        ) from exc
 
     handler.send_response(HTTPStatus.OK)
     handler.send_header("content-type", "text/event-stream")
@@ -1506,26 +1795,67 @@ def handle_zen_responses_request(handler: Any, payload: Json, config: ProxyConfi
     handler.end_headers()
 
     if family == "openai_responses":
-        outcome = _relay_stream(response, handler, request_id)
+        outcome = _relay_stream(
+            response,
+            handler,
+            request_id,
+            _restore_responses_sse_line if restore_namespaces else None,
+        )
         if outcome == "done":
-            _meter_zen(model, started, 200, retries=retries or None)
+            _meter_provider(
+                model, started, 200, provider=provider, retries=retries or None
+            )
         elif outcome == "gone":
-            _meter_zen(model, started, 0, stream_aborted=True, retries=retries or None)
+            _meter_provider(
+                model,
+                started,
+                0,
+                provider=provider,
+                stream_aborted=True,
+                retries=retries or None,
+            )
         else:
-            _meter_zen(model, started, 502, stream_aborted=True, retries=retries or None)
-        trace("zen.done", request_id=request_id, family=family, stream=True, outcome=outcome)
+            _meter_provider(
+                model,
+                started,
+                502,
+                provider=provider,
+                stream_aborted=True,
+                retries=retries or None,
+            )
+        trace(f"{provider}.done", request_id=request_id, family=family, stream=True, outcome=outcome)
         return
 
     engine = _ZenStreamEngine(
         handler, payload, config, request_id,
         family=family, bare_id=bare_id, model=model,
         response_id=new_response_id(), started=started, raw_payload=raw_payload,
+        provider=provider,
     )
     engine._start_keepalive()
     try:
-        engine.run(req)
+        engine.run(req, response, retries)
     finally:
         engine._stop_keepalive()
+
+
+def handle_zen_responses_request(handler: Any, payload: Json, config: ProxyConfig, request_id: str) -> None:
+    """Serve a /v1/responses request for a zen-routed model."""
+    model = payload.get("model") or DEFAULT_MODEL
+    ensure_zen_slug(model)
+    bare_id = bare_zen_id(model)
+    handle_family_responses_request(
+        handler,
+        payload,
+        config,
+        request_id,
+        model=model,
+        bare_id=bare_id,
+        family=zen_family_for(bare_id),
+        api_key=resolve_api_key(config, request_id),
+        base_url=zen_base_url(),
+        provider=ZEN_PROVIDER,
+    )
 
 
 def handle_zen_chat_request(handler: Any, payload: Json, config: ProxyConfig, request_id: str) -> None:

@@ -26,7 +26,6 @@ from opencode_go_proxy import catalog, routing, zen_catalog
 from opencode_go_proxy.app import (
     ProxyConfig,
     _go_reject_zen_fallback,
-    handle_chat_completions_request,
     handle_responses_request,
 )
 from opencode_go_proxy.errors import ProxyError
@@ -360,111 +359,6 @@ def chat_payload(model: str = ZEN_SLUG) -> dict:
         "messages": [{"role": "user", "content": "hello"}],
         "stream": False,
     }
-
-
-class TestChatFallback:
-    def test_go_reject_falls_back_to_zen_with_identical_messages(self) -> None:
-        _seed_collision()
-        payload = chat_payload()
-        config = make_config()
-        handler = _FakeHandler()
-
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.call_upstream_chat_verbatim",
-            return_value=(401, GO_REJECT_BODY.encode(), 0, "application/json", None),
-        ), mock.patch("opencode_go_proxy.app.handle_zen_chat_request") as zen:
-            handle_chat_completions_request(handler, payload, config, "req")
-
-        zen.assert_called_once()
-        called_handler, zen_payload, called_config, called_request_id = zen.call_args.args
-        assert called_handler is handler
-        assert called_config is config
-        assert called_request_id == "req"
-        # The zen chat handler's API takes the zen/ slug; the wire request it
-        # sends strips it back to the bare id with identical messages/stream.
-        assert zen_payload["model"] == f"zen/{ZEN_SLUG}"
-        assert zen_payload["messages"] == payload["messages"]
-        assert zen_payload["stream"] is payload["stream"]
-
-    def test_go_401_invalid_key_relayed_verbatim_no_fallback(self) -> None:
-        _seed_collision()
-        handler = _FakeHandler()
-
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.call_upstream_chat_verbatim",
-            return_value=(401, INVALID_KEY_BODY.encode(), 0, "application/json", None),
-        ), mock.patch("opencode_go_proxy.app.handle_zen_chat_request") as zen:
-            handle_chat_completions_request(handler, chat_payload(), make_config(), "req")
-
-        zen.assert_not_called()
-        assert handler.status == 401
-        assert handler.wfile.getvalue() == INVALID_KEY_BODY.encode()
-
-    def test_go_200_relayed_no_fallback(self) -> None:
-        _seed_collision()
-        ok_body = b'{"choices": [], "usage": {}}'
-        handler = _FakeHandler()
-
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.call_upstream_chat_verbatim",
-            return_value=(200, ok_body, 0, "application/json", None),
-        ), mock.patch("opencode_go_proxy.app.handle_zen_chat_request") as zen:
-            handle_chat_completions_request(handler, chat_payload(), make_config(), "req")
-
-        zen.assert_not_called()
-        assert handler.status == 200
-        assert handler.wfile.getvalue() == ok_body
-
-    def test_bare_slug_not_in_zen_ids_no_fallback(self) -> None:
-        from opencode_go_proxy import zen_catalog as _zc
-
-        _zc._ZEN_MODELS_CACHE = None
-        with open(_zc.zen_models_path(), "w") as handle:
-            json.dump({"fetched_at": "2026-08-14T00:00:00Z", "models": []}, handle)
-        handler = _FakeHandler()
-
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.call_upstream_chat_verbatim",
-            return_value=(401, GO_REJECT_BODY.encode(), 0, "application/json", None),
-        ), mock.patch("opencode_go_proxy.app.handle_zen_chat_request") as zen:
-            handle_chat_completions_request(handler, chat_payload(), make_config(), "req")
-
-        zen.assert_not_called()
-        assert handler.status == 401
-
-    def test_prefixed_opencode_go_slug_no_fallback(self) -> None:
-        _seed_collision()
-        handler = _FakeHandler()
-
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.call_upstream_chat_verbatim",
-            return_value=(401, GO_REJECT_BODY.encode(), 0, "application/json", None),
-        ), mock.patch("opencode_go_proxy.app.handle_zen_chat_request") as zen:
-            handle_chat_completions_request(handler, chat_payload(f"opencode-go/{ZEN_SLUG}"), make_config(), "req")
-
-        zen.assert_not_called()
-        assert handler.status == 401
-
-    def test_zen_attempt_error_propagates(self) -> None:
-        _seed_collision()
-        handler = _FakeHandler()
-
-        def zen_fails(handler_arg, payload, config, request_id):
-            raise ProxyError(
-                HTTPStatus.BAD_GATEWAY,
-                "zen upstream network error: boom",
-                upstream_status=None,
-                error_type="ZenNetworkError",
-            )
-
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.call_upstream_chat_verbatim",
-            return_value=(401, GO_REJECT_BODY.encode(), 0, "application/json", None),
-        ), mock.patch("opencode_go_proxy.app.handle_zen_chat_request", side_effect=zen_fails), pytest.raises(ProxyError) as ctx:
-            handle_chat_completions_request(handler, chat_payload(), make_config(), "req")
-
-        assert ctx.value.message == "zen upstream network error: boom"
-        assert ctx.value.error_type == "ZenNetworkError"
 
 
 class TestStreamingFallback:

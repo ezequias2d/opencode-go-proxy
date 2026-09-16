@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
@@ -106,7 +107,12 @@ def _relay_status(handler: Any, status: int, content_type: str, body: bytes, hea
     handler.wfile.write(body)
     handler.wfile.flush()
 
-def _relay_stream(response: Any, handler: Any, request_id: str) -> str:
+def _relay_stream(
+    response: Any,
+    handler: Any,
+    request_id: str,
+    transform_line: Callable[[bytes], bytes] | None = None,
+) -> str:
     """Relay upstream SSE lines with a keepalive comment thread.
 
     Returns the outcome: "done" when the upstream stream reached its terminal
@@ -142,6 +148,8 @@ def _relay_stream(response: Any, handler: Any, request_id: str) -> str:
                 if not client_alive:
                     outcome = "gone"
                     break
+                if transform_line is not None:
+                    line = transform_line(line)
                 try:
                     with write_lock:
                         handler.wfile.write(line)

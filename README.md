@@ -9,10 +9,10 @@ Use your own [OpenCode Go](https://opencode.ai/docs/go) and
 [OpenCode Zen](https://opencode.ai/zen) credentials in
 [Codex](https://github.com/openai/codex) through a local protocol adapter.
 
-Codex expects a Responses API (`/v1/responses`). OpenCode Go exposes an OpenAI-compatible
-Chat Completions API (`/v1/chat/completions`), and OpenCode Zen serves GPT, Claude, Gemini,
-Grok, DeepSeek, GLM, Kimi, and Qwen models over four different API surfaces. This proxy
-bridges both in one local process:
+Codex expects a Responses API (`/v1/responses`). OpenCode Go's documented
+models span Responses, Chat Completions, and Anthropic Messages, while OpenCode
+Zen also includes Gemini-family routes. This proxy selects the documented wire
+protocol for each model in one local process:
 
 ```text
 Codex app
@@ -23,7 +23,7 @@ opencode-go-proxy  ←── localhost:8787, one runtime dep (zstandard)
     │
     │  POST per family: chat/completions · responses · messages · models/<id>
     ▼
-OpenCode Go / OpenCode Zen  ── 13 open Go models · GPT, Claude, Gemini, Grok, DeepSeek, GLM, Kimi, Qwen
+OpenCode Go / OpenCode Zen  ── 28 documented Go models · optional Zen models
 ```
 
 ## Project and policy boundary
@@ -50,11 +50,10 @@ it does not provide legal or policy certification.
 
 ## Why
 
-OpenCode Go is $5 for the first month, then $10/month. You get access to 13 open coding models
-hosted in the US, EU, and Singapore. OpenCode Zen is the pay-as-you-go gateway on the same
-account, with frontier models — GPT, Claude, Gemini, Grok — alongside the open ones. Codex is a
-great agent but doesn't speak Chat Completions natively — it requires Responses-shaped providers.
-This proxy fixes that for both.
+OpenCode Go is a $10/month subscription for coding-agent access to a changing,
+provider-curated model set. Codex speaks the Responses API, while Go models
+currently require three different upstream protocols. This proxy provides that
+adapter without replacing Codex's native OpenAI authorization.
 
 ## Quick start
 
@@ -69,41 +68,53 @@ uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy \
   --bind 127.0.0.1 \
   --port 8787
 
-# Fully restart Codex, then select a model in the picker or CLI
-codex -m deepseek-v4-flash
+# Fully restart Codex, then select an explicit Go model
+codex -m opencode-go/muse-spark-1.3-contributor
 ```
+
+## Codex CLI and desktop setup
+
+Install the official Codex CLI using OpenAI's current
+[Codex CLI instructions](https://developers.openai.com/codex/cli). The
+standalone macOS/Linux installer is:
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```
+
+Then run `codex app` to open the installed Codex desktop app or start OpenAI's
+official desktop installer. Run `opencode-go-proxy config enable` once, start
+the loopback proxy, fully quit and reopen Codex, and select an
+`opencode-go/<model-id>` entry.
+
+The config command edits only its marker-delimited block in Codex's existing
+configuration. It preserves unrelated settings, native ChatGPT authorization,
+sessions, and desktop state. Run `opencode-go-proxy config disable` to remove
+only that managed block.
 
 ## Available models
 
-All 13 OpenCode Go models work through this proxy. The defaults are DeepSeek V4 Flash
-(cheapest general-purpose) and MiMo V2.5 (cheapest vision, used for image captioning).
-Switch to whatever you want in the Codex model picker or with `codex -m`.
+The checked-in catalog supports every model ID documented for OpenCode Go.
+Use the explicit `opencode-go/<model-id>` form in Codex; it avoids ambiguity
+when a Go model and a native OpenAI model have the same ID.
 
-| Model | Slug | Best for | Requests/mo on Go |
-|-------|------|----------|-------------------|
-| DeepSeek V4 Flash | `deepseek-v4-flash` | Everyday coding (default) | ~158k |
-| DeepSeek V4 Pro | `deepseek-v4-pro` | Complex reasoning | ~17k |
-| MiMo V2.5 | `mimo-v2.5` | Vision/image captioning (default) | ~150k |
-| MiMo V2.5 Pro | `mimo-v2.5-pro` | Vision + reasoning | ~16k |
-| GLM-5.2 | `glm-5.2` | Frontier open model | ~4.3k |
-| GLM-5.1 | `glm-5.1` | Previous-gen GLM | ~4.3k |
-| Kimi K2.7 Code | `kimi-k2.7-code` | Code-specialized | ~9.3k |
-| Kimi K2.6 | `kimi-k2.6` | General-purpose | ~5.8k |
-| MiniMax M3 | `minimax-m3` | MiniMax flagship | ~16k |
-| MiniMax M2.7 | `minimax-m2.7` | Previous-gen MiniMax | ~17k |
-| Qwen3.7 Max | `qwen3.7-max` | Strong reasoning | ~4.8k |
-| Qwen3.7 Plus | `qwen3.7-plus` | Mid-tier value | ~22k |
-| Qwen3.6 Plus | `qwen3.6-plus` | Previous-gen Qwen | ~16k |
+| Upstream protocol | Documented model IDs |
+|-------------------|----------------------|
+| Responses `/responses` | `grok-4.6`, `gpt-5.6-luna`, `muse-spark-1.3-contributor`, `muse-spark-1.2-contributor` |
+| Chat Completions `/chat/completions` | `glm-5.3-flash`, `glm-5.3`, `glm-5.2`, `glm-5.1`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `longcat-2.0`, `deepseek-v4.1-flash`, `deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `mimo-v2.5`, `mimo-v2.5-pro`, `hy4-preview`, `hy3` |
+| Anthropic Messages `/messages` | `minimax-m3`, `minimax-m2.7`, `minimax-m2.5`, `qwen3.8-max`, `qwen3.8-flash`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus` |
 
-Request counts are estimates from [OpenCode Go docs](https://opencode.ai/docs/go) based on
-typical usage patterns. Cheaper models = more requests per month.
+The live `/models` response can change. Runtime refresh accepts only documented
+or protocol-certified IDs, so an unknown ID is not guessed into the wrong
+protocol. The checked-in seed keeps startup and model selection working
+offline.
 
 ### Switching models
 
 ```bash
-codex -m deepseek-v4-pro
-codex -m glm-5.2
-codex -m kimi-k2.7-code
+codex -m opencode-go/deepseek-v4-pro
+codex -m opencode-go/glm-5.2
+codex -m opencode-go/minimax-m3
 ```
 
 ### How models are routed
@@ -113,7 +124,8 @@ The proxy routes the exact model Codex sends:
 1. `opencode-go/<id>` explicitly selects a known OpenCode Go catalog entry.
 2. `zen/<id>` explicitly selects a known OpenCode Zen catalog entry.
 3. A bare ID in the captured native catalog routes to the native OpenAI endpoint.
-4. A known bare Go ID routes to Go; a known Zen-only bare ID routes to Zen.
+4. A known, non-colliding bare Go ID remains a compatibility alias; a known
+   Zen-only bare ID routes to Zen.
 5. An omitted model uses `deepseek-v4-flash`. An unknown or malformed model is
    rejected before any upstream request; the proxy never silently substitutes
    another model.
@@ -170,6 +182,14 @@ local usage meter.
 
 ## API key
 
+1. Sign in to [OpenCode Zen](https://opencode.ai/zen), subscribe to OpenCode
+   Go, and copy your API key. OpenCode currently permits one Go subscriber per
+   workspace.
+2. Optionally verify the key in OpenCode itself: run `/connect`, select
+   **OpenCode Go**, paste the key, then run `/models`.
+3. Make the same user-owned key available to this proxy using one of the
+   methods below.
+
 The proxy resolves your OpenCode Go API key in this order:
 
 1. `$OPENCODE_GO_API_KEY` environment variable
@@ -183,7 +203,28 @@ export OPENCODE_GO_API_KEY="your-key-here"
 security add-generic-password -a "$USER" -s opencode-go-api-key -w
 ```
 
-Get your API key from [OpenCode Zen](https://opencode.ai/zen) after subscribing to Go.
+The key is used only for Go or Zen upstream requests. It is never substituted
+for Codex's native OpenAI authorization, and the separate remote caller token
+is never forwarded upstream.
+
+## Provider limits and data handling
+
+- OpenCode Go's current limits are dollar-based: $12 per rolling five hours,
+  $30 per week, and $60 per month. Model prices differ, so request counts vary.
+- OpenCode may monitor traffic for abuse. The proxy identifies itself as
+  `opencode-go-proxy/<version>` and sends a stable `x-opencode-session` value;
+  override the user agent only when you can still identify the client
+  truthfully with `OPENCODE_GO_PROXY_USER_AGENT`.
+- Muse Spark Contributor models are region-limited and may use prompts or
+  completions for training. They are not zero-data-retention models.
+- DeepSeek V4 prices vary during documented peak periods. Vision model image
+  inputs are billed from image dimensions as well as text.
+- After Go limits are exhausted, OpenCode's console can optionally use a
+  separate Zen balance. The proxy does not enable that setting or bypass a
+  limit.
+- Availability, pricing, retention, and limits are provider policies and may
+  change. This adapter does not alter them; review the current
+  [OpenCode Go documentation](https://opencode.ai/docs/go) before use.
 
 ## Recommended: lazycodex
 
@@ -218,7 +259,9 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Spawned threads inherit the parent session's model (`create_thread`; `chatgptWorkCloud` targets are skipped)
 - Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
 - Auth transport guard (zero config): the default listener and accepted peers are loopback-only, forged `Host: localhost` does not admit a remote peer, browser-originated requests answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
-- Verbatim `/v1/chat/completions` passthrough (stream and non-stream): the upstream status and body are relayed byte-for-byte, including the upstream's own error body, and `/v1/messages` answers an explicit `400`
+- Family-aware Go routing for Responses, Chat Completions, and Anthropic
+  Messages, including streaming and non-streaming requests with the
+  family-specific authentication header
 - Rate-limit harvesting (plan 011): upstream `x-ratelimit-*` and `anthropic-ratelimit-*` headers are parsed into per-provider quota snapshots, the latest snapshot per provider is kept, and `GET /quota` exposes `quota-state.json`
 - Menu bar state contract (plan 013): `GET /state` returns one JSON document (status, port, upstream, latest quota snapshot, today's turns/tokens, last-7-day token bars, current model) computed from the meter file and quota state
 - WebSocket upgrade requests answered with `426 Upgrade Required` (desktop app falls back to HTTP streaming)
@@ -537,10 +580,12 @@ All commands run as subcommands of the console script, for example `opencode-go-
 The proxy serves `/v1/models` from a runtime catalog in the state dir
 (`OPENCODE_GO_PROXY_STATE_DIR`, default `~/.codex/opencode-go-proxy/`). At startup it renders
 the state-dir compact catalog (or the checked-in seed at `contrib/opencode-go-models.json`)
-immediately, then refreshes in the background: models.dev discovery merges in additively,
-TTL-gated so a fresh catalog never hits the network, and the full catalog is written to
-`opencode-go-catalog.json` under the state dir. Runtime refresh never writes the repo's
-`contrib/` files; maintain the checked-in seed with `opencode-go-proxy --refresh-catalog`.
+immediately, then refreshes in the background: the authenticated OpenCode Go
+`/models` endpoint confirms currently available protocol-certified IDs,
+TTL-gated so a fresh catalog never hits the network, and the full catalog is
+written to `opencode-go-catalog.json` under the state dir. Runtime refresh never
+writes the repo's `contrib/` files; maintain the checked-in seed with
+`opencode-go-proxy --refresh-catalog`.
 
 Rendered models follow the exact key set Codex reads in codex-router's `merged-models.json`:
 `multi_agent_version` lives at the model top level, `comp_hash`/`availability_nux`/`tool_mode`

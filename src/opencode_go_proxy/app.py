@@ -27,6 +27,11 @@ from . import __version__
 from .compaction import COMPACT_PATHS, handle_compaction, has_compaction_trigger
 from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
+from .go_upstream import (
+    handle_go_chat_request,
+    handle_go_messages_request,
+    handle_go_responses_request,
+)
 from .guards import (
     check_browser_origin,
     check_client,
@@ -52,11 +57,9 @@ from .protocol import (
 from .quota import read_quota_state
 from .routing import OPENCODE_GO_PREFIX, is_known_model_slug, route_target
 from .state import build_state
-from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
 from .upstream import (
     call_upstream_chat,
-    call_upstream_chat_verbatim,
     record_cache,
     usage_tokens,
 )
@@ -73,17 +76,6 @@ Json = dict[str, Any]
 RESPONSES_PATHS = {"/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"}
 CHAT_COMPLETIONS_PATHS = {"/chat/completions", "/v1/chat/completions"}
 MESSAGES_PATHS = {"/messages", "/v1/messages"}
-MESSAGES_UNSUPPORTED: Json = {
-    "error": {
-        "type": "invalid_request_error",
-        "message": (
-            "This proxy serves a single OpenAI-compatible provider via "
-            "/v1/chat/completions and /v1/responses; /messages is not supported."
-        ),
-    }
-}
-
-
 class ProxyHTTPServer(ThreadingHTTPServer):
     """HTTP server that does not perform reverse DNS during bind."""
 
@@ -262,7 +254,10 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             })
             return
         if self.path in MESSAGES_PATHS:
-            self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
+            self._send_json(
+                {"error": {"message": "method not allowed"}},
+                status=HTTPStatus.METHOD_NOT_ALLOWED,
+            )
             return
         self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
 
@@ -275,20 +270,13 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
         try:
             self._guard_request()
-            if path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
-                if path in MESSAGES_PATHS:
-                    self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
-                else:
-                    self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
+            if path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS | MESSAGES_PATHS:
+                self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
                 return
             check_content_type(self.headers.get("content-type"))
             config = self._config()
             payload = self._read_json(config)
-            model = (
-                self._request_model(payload)
-                if path in RESPONSES_PATHS
-                else payload.get("model") or DEFAULT_MODEL
-            )
+            model = self._request_model(payload)
             trace(
                 "request.received",
                 request_id=request_id,
@@ -305,7 +293,15 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             ) and route_target(model) != "native":
                 handle_compaction(self, payload, config, request_id, path=path)
                 return
-            if path in CHAT_COMPLETIONS_PATHS:
+            if path in MESSAGES_PATHS:
+                if route_target(model) != "opencode_go":
+                    raise ProxyError(
+                        HTTPStatus.BAD_REQUEST,
+                        "/messages is available only for opencode-go Messages models",
+                        error_type="invalid_request_error",
+                    )
+                handle_go_messages_request(self, payload, config, request_id)
+            elif path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
             elif path in RESPONSES_PATHS and route_target(model) == "native":
                 # Native models relay whole to the ChatGPT backend: the body,
@@ -316,25 +312,8 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 # Zen models translate per wire family inside the zen client;
                 # they must never reach the opencode-go translation path.
                 handle_zen_responses_request(self, payload, config, request_id)
-            elif payload.get("stream") is True:
-                # Real streaming: send SSE headers, then stream from upstream in real-time.
-                self.send_response(HTTPStatus.OK)
-                self.send_header("content-type", "text/event-stream")
-                self.send_header("cache-control", "no-cache")
-                self.end_headers()
-                try:
-                    handle_streaming_request(payload, config, request_id, self.wfile)
-                except Exception as exc:  # noqa: BLE001 - defensive crash trace
-                    trace("request.crashed", request_id=request_id, message=str(exc), traceback=traceback.format_exc())
-                    try:
-                        err = json.dumps({"type": "response.error", "error": {"message": "proxy crashed; see stderr trace"}}, separators=(",",":")).encode("utf-8")
-                        self.wfile.write(b"data: " + err + b"\n\ndata: [DONE]\n\n")
-                        self.wfile.flush()
-                    except BrokenPipeError:
-                        pass
             else:
-                response = handle_responses_request(payload, config, request_id)
-                self._send_json(response)
+                handle_go_responses_request(self, payload, config, request_id)
         except ProxyError as exc:
             trace("request.failed", request_id=request_id, status=exc.status, message=exc.message)
             self._send_proxy_error(exc)
@@ -587,44 +566,7 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
         # key and base; the opencode-go upstream is never involved.
         handle_zen_chat_request(handler, payload, config, request_id)
         return
-    if payload.get("stream") is True:
-        handle_chat_stream_passthrough(payload, config, request_id, handler)
-        return
-    started = time.time()
-    status, body, retries, content_type, retry_after = call_upstream_chat_verbatim(payload, config, request_id)
-    model = payload.get("model") or DEFAULT_MODEL
-    if _go_reject_zen_fallback(model, status, body):
-        # The go gateway advertises this bare slug but does not serve it; the
-        # zen chat handler relays with the zen/ prefix (its API contract) and
-        # strips it before sending, so the wire request keeps the identical
-        # messages/tools/stream and the bare id.
-        trace("fallback.go_reject_zen", request_id=request_id, model=model,
-              status=status, path="chat/completions")
-        zen_payload = dict(payload)
-        zen_payload["model"] = f"{ZEN_PREFIX}{model}"
-        handle_zen_chat_request(handler, zen_payload, config, request_id)
-        return
-    elif is_go_not_supported_rejection(model, status, body):
-        # The go catalog advertises this bare slug but the gateway does not
-        # serve it and zen does not own it: count the rejection so the picker
-        # self-cleans after two strikes.
-        record_go_unsupported(model)
-    if 200 <= status < 300:
-        # A 2xx proves the go gateway serves the slug: clear its strikes and
-        # restore it if this process auto-hid it.
-        clear_go_unsupported(model)
-    record_usage_event(
-        model=payload.get("model") or DEFAULT_MODEL, status=status,
-        duration_ms=int((time.time() - started) * 1000), retries=retries or None,
-    )
-    handler.send_response(status)
-    handler.send_header("content-type", content_type or "application/json")
-    if retry_after:
-        handler.send_header("retry-after", retry_after)
-    handler.send_header("content-length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
-    handler.wfile.flush()
+    handle_go_chat_request(handler, payload, config, request_id)
 
 
 def build_parser() -> argparse.ArgumentParser:

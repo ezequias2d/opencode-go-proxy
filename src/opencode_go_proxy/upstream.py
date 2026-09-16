@@ -21,6 +21,7 @@ from .protocol import cache_stats_from_usage
 from .quota import record_quota_from_headers
 from .secrets import resolve_api_key
 from .trace import _mask_trace_body, trace
+from .upstream_headers import upstream_user_agent
 
 Json = dict[str, Any]
 
@@ -90,7 +91,7 @@ def _chat_request(url: str, api_key: str, raw_payload: bytes, accept: str) -> ur
             "authorization": f"Bearer {api_key}",
             "content-type": "application/json",
             "accept": accept,
-            "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+            "user-agent": upstream_user_agent(),
         },
         method="POST",
     )

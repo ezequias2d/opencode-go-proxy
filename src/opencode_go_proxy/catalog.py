@@ -1,13 +1,13 @@
-"""Discover opencode models and render the full-shape catalog Codex consumes.
+"""Discover OpenCode Go models and render the full-shape catalog Codex consumes.
 
 The compact catalog (a JSON file with a "models" list, see
-contrib/opencode-go-models.json) is the checked-in seed. models.dev publishes a
-provider map where providerID "opencode" lists the models available through the
-opencode provider; discovery additively merges those entries into the seed.
+contrib/opencode-go-models.json) is the checked-in seed. OpenCode Go's
+authenticated ``/models`` endpoint confirms which certified models are
+currently available; discovery additively merges those entries into the seed.
 
 The runtime pipeline is layered:
 
-1. Seed/merge: state-dir compact (else checked-in seed) plus models.dev
+1. Seed/merge: state-dir compact (else checked-in seed) plus OpenCode Go
    discovery, TTL-gated so a fresh catalog never hits the network and
    conditional-GET'd (If-None-Match on the stored ETag) so an unchanged
    catalog is never re-downloaded.
@@ -36,12 +36,16 @@ from http import HTTPStatus
 from typing import Any
 
 from . import __version__
+from .config import ProxyConfig, resolve_chat_base_url
+from .errors import ProxyError
+from .go_models import certified_go_models
 from .meter import state_dir
+from .secrets import configured_key_env, resolve_api_key
 from .trace import trace
 
 Json = dict[str, Any]
 
-MODELS_DEV_URL = "https://models.dev/api.json"
+GO_MODELS_PATH = "/models"
 DEFAULT_TTL_HOURS = 24
 CATALOG_REFRESH_ENV = "OPENCODE_GO_CATALOG_REFRESH"
 SEED_CATALOG_ENV = "OPENCODE_GO_PROXY_SEED_CATALOG"
@@ -155,7 +159,7 @@ def _default_model_record() -> dict:
 
 
 def _model_from_discovery(m: dict) -> dict:
-    """Build a compact model record from a models.dev entry."""
+    """Build a compact model record from a discovered Go model entry."""
     record = _default_model_record()
     context = m.get("limit", {}).get("context") if isinstance(m.get("limit"), dict) else None
     modalities = m.get("modalities")
@@ -187,11 +191,11 @@ def _model_from_discovery(m: dict) -> dict:
 
 
 class CatalogDiscoveryError(Exception):
-    """Raised when the models.dev catalog cannot be fetched or parsed."""
+    """Raised when the OpenCode Go catalog cannot be fetched or parsed."""
 
 
 class CatalogNotModified(CatalogDiscoveryError):
-    """Raised when models.dev answers 304 to a conditional GET.
+    """Raised when OpenCode Go answers 304 to a conditional GET.
 
     Carries the etag that was sent so the caller can trace the cached-refresh
     event and keep its existing compact untouched.
@@ -203,22 +207,27 @@ class CatalogNotModified(CatalogDiscoveryError):
 
 
 def discover_models(timeout: int = 10, etag: str | None = None) -> tuple[list[dict], str | None]:
-    """Return (models, etag) from models.dev whose providerID is "opencode".
-
-    Each model dict is a models.dev entry (id, name, description,
-    context/modalities/reasoning/cost when present). The second element is the
-    response ETag header (None when the server sends none); the caller stores
-    it in the compact so the next refresh can send it back. When `etag` is
-    given it is sent as If-None-Match, and a 304 answer raises
-    CatalogNotModified so the caller can keep its existing catalog instead of
-    re-downloading. models.dev rejects the default urllib User-Agent with 403,
-    so the fetch sends an identifying UA. Raises CatalogDiscoveryError on
-    network failure or malformed JSON.
-    """
-    headers = {"User-Agent": f"opencode-go-proxy/{__version__}"}
+    """Return certified model IDs and ETag from OpenCode Go ``/models``."""
+    config = ProxyConfig(
+        bind="127.0.0.1",
+        port=8787,
+        chat_base_url=resolve_chat_base_url(),
+        api_key_env=configured_key_env(),
+        timeout_sec=timeout,
+        max_body_bytes=1024 * 1024,
+    )
+    try:
+        api_key = resolve_api_key(config, "catalog-refresh")
+    except ProxyError as exc:
+        raise CatalogDiscoveryError(exc.message) from exc
+    url = f"{config.chat_base_url}{GO_MODELS_PATH}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": f"opencode-go-proxy/{__version__}",
+    }
     if etag:
         headers["If-None-Match"] = etag
-    request = urllib.request.Request(MODELS_DEV_URL, headers=headers)
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             payload: Json = json.load(resp)
@@ -226,19 +235,19 @@ def discover_models(timeout: int = 10, etag: str | None = None) -> tuple[list[di
     except urllib.error.HTTPError as exc:
         if exc.code == HTTPStatus.NOT_MODIFIED:
             raise CatalogNotModified(etag) from exc
-        raise CatalogDiscoveryError(f"failed to fetch {MODELS_DEV_URL}: {exc}") from exc
+        raise CatalogDiscoveryError(f"failed to fetch {url}: {exc}") from exc
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise CatalogDiscoveryError(f"failed to fetch {MODELS_DEV_URL}: {exc}") from exc
+        raise CatalogDiscoveryError(f"failed to fetch {url}: {exc}") from exc
 
-    provider = payload.get("opencode")
-    if not isinstance(provider, dict):
+    raw_models = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw_models, list):
         return [], upstream_etag
-    models = provider.get("models")
-    if isinstance(models, dict):
-        return [entry for entry in models.values() if isinstance(entry, dict)], upstream_etag
-    if isinstance(models, list):
-        return [entry for entry in models if isinstance(entry, dict)], upstream_etag
-    return [], upstream_etag
+    certified = certified_go_models()
+    return [
+        entry
+        for entry in raw_models
+        if isinstance(entry, dict) and entry.get("id") in certified
+    ], upstream_etag
 
 
 def default_catalog_path() -> str:
@@ -731,7 +740,7 @@ def _render_and_write(compact: dict, catalog_path: str, overlay: bool = False) -
 def _content_etag(models: list[dict]) -> str:
     """Weak etag from the serialized model list; stable for identical content.
 
-    Used when models.dev sends no ETag header. The old daily synthetic etag
+    Used when OpenCode Go sends no ETag header. The old daily synthetic etag
     churned the Codex client cache every day even when the catalog never
     changed, so the fallback is derived from the content itself: the model
     list serialized deterministically (sorted by slug, sorted keys, compact
@@ -757,7 +766,7 @@ def refresh_catalog(
     force: bool = False,
     overlay: bool = False,
 ) -> dict:
-    """Refresh the compact catalog from models.dev when stale, then re-render.
+    """Refresh the compact catalog from OpenCode Go when stale, then re-render.
 
     Default paths resolve under the state dir (OPENCODE_GO_PROXY_STATE_DIR), so
     the runtime refresh never writes the repo's checked-in contrib files. The
@@ -815,7 +824,7 @@ def refresh_catalog(
         discovered, upstream_etag = discover_models(etag=None if force else stored_etag)
     except CatalogNotModified:
         trace("catalog.refresh.cached", etag=stored_etag)
-        # 304: models.dev content is unchanged. Keep the existing compact (and
+        # 304: OpenCode Go content is unchanged. Keep the existing compact (and
         # its etag) untouched and skip the re-render; serve the catalog that
         # is already on disk. Render only in the degenerate case where a
         # catalog file is missing despite a compact.
@@ -825,23 +834,28 @@ def refresh_catalog(
         return _render_and_write(existing, catalog_path, overlay=overlay)
     except CatalogDiscoveryError:
         # Offline first run: fall back to the seed so a fresh install that
-        # cannot reach models.dev still renders a valid catalog. Honor an
+        # cannot reach OpenCode Go still renders a valid catalog. Honor an
         # explicit seed_path, not just the default seed.
         fallback = _load_if_readable(compact_path) or _load_if_readable(seed_path)
         if fallback is not None:
             return _render_and_write(fallback, catalog_path, overlay=overlay)
         raise
 
-    models = list(existing.get("models", []))
+    certified = certified_go_models()
+    models = [
+        record
+        for record in existing.get("models", [])
+        if isinstance(record, dict) and record.get("slug") in certified
+    ]
     known = {record.get("slug") for record in models if isinstance(record, dict) and record.get("slug")}
     for entry in discovered:
         model_id = entry.get("id")
-        if model_id and model_id not in known:
+        if model_id in certified and model_id not in known:
             models.append(_model_from_discovery(entry))
             known.add(model_id)
     compact = {
         "fetched_at": iso,
-        # models.dev's real ETag when it sends one, else a content hash: both
+        # OpenCode Go's real ETag when it sends one, else a content hash: both
         # are stable while the model set is unchanged, so the Codex client's
         # catalog cache does not churn on every refresh.
         "etag": upstream_etag or _content_etag(models),
@@ -927,7 +941,11 @@ def _zen_merged_records(go_records: list[Json] | None = None) -> list[Json]:
     go_display_names = {
         str(record.get("display_name")) for record in go_records if record.get("display_name")
     }
-    go_slugs = {str(record.get("slug")) for record in go_records if record.get("slug")}
+    go_slugs = {
+        str(record.get("slug")).removeprefix("opencode-go/")
+        for record in go_records
+        if record.get("slug")
+    }
     families = zen_families()
     records = []
     for model_id in sorted(zen_model_ids()):
@@ -972,11 +990,28 @@ def _clamp_efforts(models: list[Json], native_efforts: set[str]) -> list[Json]:
     return clamped
 
 
+def _go_merged_records(models: list[Json]) -> list[Json]:
+    """Render every Go picker entry with an explicit provider prefix."""
+    records = []
+    for model in models:
+        bare_id = str(model.get("slug") or "")
+        if not bare_id:
+            continue
+        slug = f"opencode-go/{bare_id}"
+        record = {**model, "slug": slug}
+        display_name = str(record.get("display_name") or bare_id)
+        if "OpenCode Go" not in display_name:
+            record["display_name"] = f"{display_name} (OpenCode Go)"
+        record["comp_hash"] = _comp_hash_for(slug)
+        records.append(record)
+    return records
+
+
 def render_merged_catalog() -> dict:
     """Compose the native capture with the opencode-go catalog as merged-models.json.
 
-    Native entries keep their captured slugs; opencode-go entries keep bare
-    slugs and their reasoning levels are clamped to the native effort
+    Native entries keep their captured slugs; opencode-go entries use explicit
+    ``opencode-go/<id>`` slugs and their reasoning levels are clamped to the native effort
     vocabulary; zen entries are slug-prefixed zen/<id> with their family on
     the record and a " (Zen)" display-name suffix when the opencode-go side
     shares their bare id or display name. The opencode-go side runs the same
@@ -1000,7 +1035,9 @@ def render_merged_catalog() -> dict:
         }
     rendered = render_runtime_catalog(compact)
     native = load_native_capture()
-    go_models = _clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native))
+    go_models = _go_merged_records(
+        _clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native))
+    )
     models = [_full_native_record(entry) for entry in native.get("models", [])]
     models.extend(go_models)
     models.extend(_zen_merged_records(go_models))
@@ -1081,8 +1118,8 @@ __all__ = [
     "CANONICAL_MODEL_KEYS",
     "CATALOG_REFRESH_ENV",
     "DEFAULT_TTL_HOURS",
+    "GO_MODELS_PATH",
     "MERGE_CATALOG_NAME",
-    "MODELS_DEV_URL",
     "MODEL_MESSAGES_KEYS",
     "OVERLAY_EDIT_KEYS",
     "SEED_CATALOG_ENV",
