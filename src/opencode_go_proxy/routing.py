@@ -105,6 +105,17 @@ def _go_compact_slugs() -> set[str]:
     return set(slugs)
 
 
+def opencode_go_model_slugs() -> set[str]:
+    """Bare model slugs explicitly present in the Go catalog or user overlay."""
+    slugs = _go_compact_slugs()
+    slugs.update(
+        str(entry.get("slug"))
+        for entry in catalog.read_user_models()
+        if isinstance(entry, dict) and entry.get("slug")
+    )
+    return slugs
+
+
 def _file_mtime(path: str) -> int | None:
     try:
         return os.stat(path).st_mtime_ns
@@ -133,3 +144,19 @@ def route_target(slug: str, native_slugs: set[str] | None = None) -> RouteTarget
     if slug in zen_model_ids() and slug not in _go_compact_slugs():
         return "zen"
     return "opencode_go"
+
+
+def is_known_model_slug(slug: str) -> bool:
+    """Whether a requested slug belongs to the captured native, Go, or Zen set."""
+    if not slug:
+        return False
+    if slug.startswith(OPENCODE_GO_PREFIX):
+        return normalize_model_slug(slug) in opencode_go_model_slugs()
+    if slug.startswith(ZEN_PREFIX):
+        return normalize_model_slug(slug) in zen_model_ids()
+    if slug in native_model_slugs():
+        return True
+    go_slugs = opencode_go_model_slugs()
+    if slug in go_slugs:
+        return True
+    return slug in zen_model_ids()

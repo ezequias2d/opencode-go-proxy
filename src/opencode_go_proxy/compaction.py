@@ -32,20 +32,22 @@ from typing import Any
 
 from .config import ProxyConfig
 from .errors import ProxyError
+from .go_models import go_family_for
+from .go_upstream import GO_PROVIDER
 from .meter import record_usage_event
+from .opencode_session import opencode_session_headers
 from .protocol import (
     DEFAULT_MODEL,
     flatten_content,
-    known_models,
     new_response_id,
     output_text_from_items,
 )
 from .routing import normalize_model_slug, route_target
 from .secrets import resolve_api_key
 from .trace import trace
-from .upstream import call_upstream_chat, usage_tokens
 from .zen_upstream import (
     ZEN_PROVIDER,
+    _build_family_request,
     _build_zen_request,
     _translate_response,
     _zen_post,
@@ -146,18 +148,6 @@ def render_transcript(input_value: Any, budget: int = TRANSCRIPT_BUDGET) -> str:
     return transcript
 
 
-def _chat_text(chat: Json) -> str:
-    """The assistant text of one non-stream chat-completions response."""
-    choices = chat.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message = choices[0].get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-    return ""
-
-
 def _responses_text(response: Json) -> str:
     """The output text of one Responses-shaped object."""
     output_text = response.get("output_text")
@@ -167,22 +157,58 @@ def _responses_text(response: Json) -> str:
 
 
 def _summarize_go(model: str, transcript: str, config: ProxyConfig, request_id: str) -> tuple[str, Any, Any, Any, int]:
-    """One non-stream opencode-go chat-completions summarization call."""
+    """One non-stream OpenCode Go summarization call through the model's family."""
     bare = normalize_model_slug(model)
-    if bare not in known_models():
-        bare = DEFAULT_MODEL
-    chat_payload: Json = {
-        "model": bare,
-        "messages": [
-            {"role": "user", "content": transcript},
-            {"role": "user", "content": COMPACT_PROMPT},
+    family = go_family_for(bare)
+    api_key = resolve_api_key(config, request_id)
+    payload: Json = {
+        "model": model,
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": transcript}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": COMPACT_PROMPT}]},
         ],
         "stream": False,
     }
-    trace("compaction.summarize", request_id=request_id, target="opencode-go", model=bare, transcript_chars=len(transcript))
-    chat, retries = call_upstream_chat(chat_payload, config, request_id)
-    summary = _chat_text(chat) or PLACEHOLDER_SUMMARY
-    inp, outp, total = usage_tokens(chat.get("usage"))
+    url, body, headers = _build_family_request(
+        payload,
+        family,
+        bare,
+        api_key,
+        stream=False,
+        session_model=model,
+        base_url=config.chat_base_url,
+        extra_headers=opencode_session_headers(None, payload),
+    )
+    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    trace(
+        "compaction.summarize",
+        request_id=request_id,
+        target=GO_PROVIDER,
+        model=bare,
+        transcript_chars=len(transcript),
+    )
+    try:
+        value, retries = _zen_post(
+            url,
+            raw_payload,
+            headers,
+            config,
+            request_id,
+            provider=GO_PROVIDER,
+        )
+    except ProxyError as exc:
+        if int(exc.status) < 500:
+            raise
+        raise ProxyError(
+            HTTPStatus.BAD_GATEWAY,
+            f"upstream HTTP {int(exc.status)}: {exc.message}",
+            retries=exc.retries,
+            upstream_status=int(exc.status),
+            headers=exc.headers,
+            body=exc.body,
+        ) from exc
+    summary = _responses_text(_translate_response(value, family, model)) or PLACEHOLDER_SUMMARY
+    inp, outp, total = _zen_tokens(value, family)
     return summary, inp, outp, total, retries
 
 
@@ -303,7 +329,7 @@ def handle_compaction(
     started = time.time()
     v2 = path not in COMPACT_PATHS
     model = payload.get("model") or DEFAULT_MODEL
-    provider = ZEN_PROVIDER if route_target(model) == "zen" else None
+    provider = ZEN_PROVIDER if route_target(model) == "zen" else GO_PROVIDER
     try:
         summary, inp, outp, total, retries = _summarize(payload, model, config, request_id)
     except ProxyError as exc:

@@ -181,6 +181,8 @@ def _catalog_views() -> tuple[str, int | None, set[str], dict[str, int], set[str
                 modalities = entry.get("input_modalities")
                 if isinstance(modalities, list) and "image" in modalities:
                     image_slugs.add(slug)
+                    if slug.startswith("opencode-go/"):
+                        image_slugs.add(normalize_model_slug(slug))
     except (OSError, json.JSONDecodeError):
         pass
     _CATALOG_CACHE = (path, mtime, slugs, windows, image_slugs)
@@ -211,7 +213,8 @@ def model_context_window(model: str) -> int | None:
     file mtime. Used to cap zero-input-token estimates at the model's real
     window instead of a proxy-wide default.
     """
-    return _catalog_views()[3].get(model)
+    windows = _catalog_views()[3]
+    return windows.get(model) or windows.get(f"opencode-go/{normalize_model_slug(model)}")
 
 
 def image_capable_models() -> set[str]:
@@ -618,6 +621,49 @@ def responses_tools_to_chat_tools(tools: Any) -> tuple[list[Json] | None, Json]:
     return chat_tools, stats
 
 
+def responses_tools_to_function_tools(tools: Any) -> tuple[list[Json] | None, Json]:
+    """Normalize Responses tools to the ordinary function-only shape."""
+    chat_tools, stats = responses_tools_to_chat_tools(tools)
+    if chat_tools is None:
+        return None, stats
+    result = []
+    for tool in chat_tools:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        result.append(
+            {
+                "type": "function",
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters")
+                or {"type": "object", "properties": {}},
+            }
+        )
+    return result or None, stats
+
+
+def restore_namespaced_function_calls(value: Any) -> Any:
+    """Restore ``namespace__name`` calls in Responses objects and SSE events."""
+    if isinstance(value, list):
+        return [restore_namespaced_function_calls(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    restored = {
+        key: restore_namespaced_function_calls(item) for key, item in value.items()
+    }
+    if restored.get("type") != "function_call" or "namespace" in restored:
+        return restored
+    name = restored.get("name")
+    if not isinstance(name, str) or "__" not in name:
+        return restored
+    namespace, _, local_name = name.rpartition("__")
+    if namespace and local_name:
+        restored["namespace"] = namespace
+        restored["name"] = local_name
+    return restored
+
+
 def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     messages, message_stats = responses_input_to_chat_messages(payload)
     tools, tool_stats = responses_tools_to_chat_tools(payload.get("tools"))
@@ -633,15 +679,11 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     # one arrives here anyway, its model is never rewritten. For opencode-go
     # targets the prefixed slug is checked against the catalog by its bare
     # form, and the upstream chat payload addresses the provider with the
-    # bare slug (the reference router's upstreamModel). Unknown non-native
-    # slugs fall back to DEFAULT_MODEL, exactly as before the alias map died.
+    # bare slug.
     if route_target(incoming_model) == "native":
         upstream_model = incoming_model
     else:
         bare = normalize_model_slug(incoming_model)
-        if bare not in known_models():
-            incoming_model = DEFAULT_MODEL
-            bare = incoming_model
         if has_image:
             if bare in image_capable_models():
                 upstream_model = bare

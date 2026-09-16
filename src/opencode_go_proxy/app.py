@@ -19,6 +19,7 @@ import traceback
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -26,7 +27,18 @@ from . import __version__
 from .compaction import COMPACT_PATHS, handle_compaction, has_compaction_trigger
 from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
-from .guards import check_browser_origin, check_content_type, check_host
+from .go_upstream import (
+    handle_go_chat_request,
+    handle_go_messages_request,
+    handle_go_responses_request,
+)
+from .guards import (
+    check_browser_origin,
+    check_client,
+    check_content_type,
+    check_host,
+    validate_bind_security,
+)
 from .meter import (
     DEFAULT_ESTIMATE_CONTEXT_WINDOW,
     estimate_input_tokens,
@@ -43,13 +55,11 @@ from .protocol import (
     responses_payload_to_chat_payload,
 )
 from .quota import read_quota_state
-from .routing import OPENCODE_GO_PREFIX, route_target
+from .routing import OPENCODE_GO_PREFIX, is_known_model_slug, route_target
 from .state import build_state
-from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
 from .upstream import (
     call_upstream_chat,
-    call_upstream_chat_verbatim,
     record_cache,
     usage_tokens,
 )
@@ -66,15 +76,13 @@ Json = dict[str, Any]
 RESPONSES_PATHS = {"/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"}
 CHAT_COMPLETIONS_PATHS = {"/chat/completions", "/v1/chat/completions"}
 MESSAGES_PATHS = {"/messages", "/v1/messages"}
-MESSAGES_UNSUPPORTED: Json = {
-    "error": {
-        "type": "invalid_request_error",
-        "message": (
-            "This proxy serves a single OpenAI-compatible provider via "
-            "/v1/chat/completions and /v1/responses; /messages is not supported."
-        ),
-    }
-}
+class ProxyHTTPServer(ThreadingHTTPServer):
+    """HTTP server that does not perform reverse DNS during bind."""
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = int(self.server_address[1])
 
 
 def _decompress_bounded(reader: Any, cap: int) -> bytes:
@@ -143,9 +151,10 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
 
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
     def _guard_request(self) -> None:
-        """Plan 006 transport guard: loopback Host, then no browser markers."""
+        """Enforce the local or explicitly authenticated remote boundary."""
         check_host(self.headers.get("Host"))
         check_browser_origin(self.headers)
+        check_client(self.client_address[0], self.headers)
 
     @staticmethod
     def _error_payload(exc: ProxyError) -> Json:
@@ -161,6 +170,25 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         if exc.headers and exc.headers.get("retry-after"):
             headers = {"retry-after": exc.headers["retry-after"]}
         self._send_json(self._error_payload(exc), status=exc.status, headers=headers)
+
+    @staticmethod
+    def _request_model(payload: Json) -> str:
+        raw_model = payload.get("model")
+        if raw_model is None:
+            return DEFAULT_MODEL
+        if not isinstance(raw_model, str) or not raw_model:
+            raise ProxyError(
+                HTTPStatus.BAD_REQUEST,
+                "model must be a non-empty string",
+                error_type="invalid_request_error",
+            )
+        if not is_known_model_slug(raw_model):
+            raise ProxyError(
+                HTTPStatus.BAD_REQUEST,
+                f"unknown model {raw_model!r}; refresh the catalog or add it to user-models.json",
+                error_type="model_not_found",
+            )
+        return raw_model
 
     def _reject_websocket_upgrade(self) -> bool:
         """Reject a realtime WebSocket upgrade with HTTP/1.1 426.
@@ -226,7 +254,10 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             })
             return
         if self.path in MESSAGES_PATHS:
-            self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
+            self._send_json(
+                {"error": {"message": "method not allowed"}},
+                status=HTTPStatus.METHOD_NOT_ALLOWED,
+            )
             return
         self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
 
@@ -239,16 +270,13 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
         try:
             self._guard_request()
-            if path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
-                if path in MESSAGES_PATHS:
-                    self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
-                else:
-                    self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
+            if path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS | MESSAGES_PATHS:
+                self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
                 return
             check_content_type(self.headers.get("content-type"))
             config = self._config()
             payload = self._read_json(config)
-            model = payload.get("model") or DEFAULT_MODEL
+            model = self._request_model(payload)
             trace(
                 "request.received",
                 request_id=request_id,
@@ -265,7 +293,15 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             ) and route_target(model) != "native":
                 handle_compaction(self, payload, config, request_id, path=path)
                 return
-            if path in CHAT_COMPLETIONS_PATHS:
+            if path in MESSAGES_PATHS:
+                if route_target(model) != "opencode_go":
+                    raise ProxyError(
+                        HTTPStatus.BAD_REQUEST,
+                        "/messages is available only for opencode-go Messages models",
+                        error_type="invalid_request_error",
+                    )
+                handle_go_messages_request(self, payload, config, request_id)
+            elif path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
             elif path in RESPONSES_PATHS and route_target(model) == "native":
                 # Native models relay whole to the ChatGPT backend: the body,
@@ -276,25 +312,8 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 # Zen models translate per wire family inside the zen client;
                 # they must never reach the opencode-go translation path.
                 handle_zen_responses_request(self, payload, config, request_id)
-            elif payload.get("stream") is True:
-                # Real streaming: send SSE headers, then stream from upstream in real-time.
-                self.send_response(HTTPStatus.OK)
-                self.send_header("content-type", "text/event-stream")
-                self.send_header("cache-control", "no-cache")
-                self.end_headers()
-                try:
-                    handle_streaming_request(payload, config, request_id, self.wfile)
-                except Exception as exc:  # noqa: BLE001 - defensive crash trace
-                    trace("request.crashed", request_id=request_id, message=str(exc), traceback=traceback.format_exc())
-                    try:
-                        err = json.dumps({"type": "response.error", "error": {"message": "proxy crashed; see stderr trace"}}, separators=(",",":")).encode("utf-8")
-                        self.wfile.write(b"data: " + err + b"\n\ndata: [DONE]\n\n")
-                        self.wfile.flush()
-                    except BrokenPipeError:
-                        pass
             else:
-                response = handle_responses_request(payload, config, request_id)
-                self._send_json(response)
+                handle_go_responses_request(self, payload, config, request_id)
         except ProxyError as exc:
             trace("request.failed", request_id=request_id, status=exc.status, message=exc.message)
             self._send_proxy_error(exc)
@@ -547,44 +566,7 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
         # key and base; the opencode-go upstream is never involved.
         handle_zen_chat_request(handler, payload, config, request_id)
         return
-    if payload.get("stream") is True:
-        handle_chat_stream_passthrough(payload, config, request_id, handler)
-        return
-    started = time.time()
-    status, body, retries, content_type, retry_after = call_upstream_chat_verbatim(payload, config, request_id)
-    model = payload.get("model") or DEFAULT_MODEL
-    if _go_reject_zen_fallback(model, status, body):
-        # The go gateway advertises this bare slug but does not serve it; the
-        # zen chat handler relays with the zen/ prefix (its API contract) and
-        # strips it before sending, so the wire request keeps the identical
-        # messages/tools/stream and the bare id.
-        trace("fallback.go_reject_zen", request_id=request_id, model=model,
-              status=status, path="chat/completions")
-        zen_payload = dict(payload)
-        zen_payload["model"] = f"{ZEN_PREFIX}{model}"
-        handle_zen_chat_request(handler, zen_payload, config, request_id)
-        return
-    elif is_go_not_supported_rejection(model, status, body):
-        # The go catalog advertises this bare slug but the gateway does not
-        # serve it and zen does not own it: count the rejection so the picker
-        # self-cleans after two strikes.
-        record_go_unsupported(model)
-    if 200 <= status < 300:
-        # A 2xx proves the go gateway serves the slug: clear its strikes and
-        # restore it if this process auto-hid it.
-        clear_go_unsupported(model)
-    record_usage_event(
-        model=payload.get("model") or DEFAULT_MODEL, status=status,
-        duration_ms=int((time.time() - started) * 1000), retries=retries or None,
-    )
-    handler.send_response(status)
-    handler.send_header("content-type", content_type or "application/json")
-    if retry_after:
-        handler.send_header("retry-after", retry_after)
-    handler.send_header("content-length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
-    handler.wfile.flush()
+    handle_go_chat_request(handler, payload, config, request_id)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -733,6 +715,14 @@ def main(argv: list[str] | None = None) -> None:
 
         sys.exit(ops.update_cmd(args_list[1:]))
     args = build_parser().parse_args(args_list)
+    if args.timeout_sec <= 0:
+        sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
+        sys.exit(2)
+    try:
+        validate_bind_security(args.bind)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        sys.exit(2)
     try:
         from opencode_go_proxy import catalog as _catalog
         from opencode_go_proxy import native_models
@@ -748,13 +738,6 @@ def main(argv: list[str] | None = None) -> None:
         _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
-    # The full refresh may fetch models.dev (up to a 10s timeout); run it in
-    # the background so startup never blocks on the network, and keep a
-    # low-frequency timer re-running it (both threads daemon=True).
-    _start_catalog_refresh()
-    if args.timeout_sec <= 0:
-        sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
-        sys.exit(2)
     config = ProxyConfig(
         bind=args.bind,
         port=args.port,
@@ -764,9 +747,12 @@ def main(argv: list[str] | None = None) -> None:
         max_body_bytes=args.max_body_mb * 1024 * 1024,
     )
     if config.bind not in {"127.0.0.1", "localhost", "::1"}:
-        trace("security.warning", bind=config.bind,
-              message="binding to non-localhost address — proxy exposes upstream API key to network")
-    server = ThreadingHTTPServer((config.bind, config.port), ResponsesProxyHandler)
+        trace(
+            "security.remote_enabled",
+            bind=config.bind,
+            message="non-loopback listener protected by a separate caller token",
+        )
+    server = ProxyHTTPServer((config.bind, config.port), ResponsesProxyHandler)
     server.config = config  # type: ignore[attr-defined]
     trace(
         "server.start",
@@ -782,6 +768,9 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
     try:
         serve_thread.start()
+        # Network catalog refresh starts only after the listener is ready, so
+        # slow discovery cannot delay local health checks or client startup.
+        _start_catalog_refresh()
         serve_thread.join()
     except KeyboardInterrupt:
         trace("server.stop", reason="keyboard_interrupt")

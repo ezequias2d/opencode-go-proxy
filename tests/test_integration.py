@@ -8,12 +8,11 @@ import threading
 import urllib.error
 import urllib.request
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
 from unittest import mock
 
 import pytest
 
-from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
+from opencode_go_proxy.app import ProxyConfig, ProxyHTTPServer, ResponsesProxyHandler
 
 
 def make_config(port: int) -> ProxyConfig:
@@ -71,7 +70,7 @@ def server():
     sock.close()
 
     config = make_config(port)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), ResponsesProxyHandler)
+    httpd = ProxyHTTPServer(("127.0.0.1", port), ResponsesProxyHandler)
     httpd.config = config  # type: ignore[attr-defined]
 
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -278,7 +277,7 @@ class TestStreamingResponse:
         assert "hel" in raw_text
         assert "lo" in raw_text
 
-    def test_streaming_missing_api_key_sends_error_event(self, server):
+    def test_streaming_missing_api_key_fails_before_sse(self, server):
         port, _ = server
         from opencode_go_proxy.secrets import clear_api_key_cache
         clear_api_key_cache()
@@ -294,15 +293,14 @@ class TestStreamingResponse:
             raw = resp.read()
             conn.close()
 
-        assert resp.status == 200
-        raw_text = raw.decode("utf-8")
-        assert "response.error" in raw_text
-        assert "[DONE]" in raw_text
+        assert resp.status == 401
+        body = json.loads(raw)
+        assert body["error"]["type"] == "proxy_error"
 
-    def test_streaming_crash_sends_sse_error(self, server):
+    def test_streaming_translation_crash_fails_before_sse(self, server):
         port, _ = server
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.streaming.responses_payload_to_chat_payload",
+            "opencode_go_proxy.zen_upstream.responses_payload_to_chat_payload",
             side_effect=ValueError("boom"),
         ):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
@@ -313,10 +311,9 @@ class TestStreamingResponse:
             raw = resp.read()
             conn.close()
 
-        assert resp.status == 200
-        raw_text = raw.decode("utf-8")
-        assert "response.error" in raw_text
-        assert "[DONE]" in raw_text
+        assert resp.status == 500
+        body = json.loads(raw)
+        assert body["error"]["type"] == "proxy_crash"
 
 
 class TestEdgeCases:
@@ -470,28 +467,58 @@ class TestGracefulShutdown:
                 proc.wait(timeout=5)
 
 
-class TestUnknownSlugFallback:
-    def test_native_slug_without_capture_falls_back_to_default_model(self, server):
-        # The old gpt-* -> deepseek alias hijack is gone. Without a native
-        # capture the native set is empty, so the slug routes to OpenCode Go
-        # and the unknown-slug fallback picks DEFAULT_MODEL. With a native
-        # capture this request would never reach translation (native
-        # pass-through); test_passthrough.py covers that path.
+class TestUnknownModelRejection:
+    def test_native_slug_without_capture_fails_closed(self, server):
         port, _ = server
-        mock_resp = mock_chat_response("ok", model="deepseek-v4-flash")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())) as mock_urlopen:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen"
+        ) as mock_urlopen:
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request("POST", "/v1/responses",
                          json.dumps({"model": "gpt-5.5", "input": "hi"}),
                          {"content-type": "application/json"})
             resp = conn.getresponse()
-            resp.read()
+            body = json.loads(resp.read())
             conn.close()
 
-        assert resp.status == 200
-        sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
-        assert sent_payload["model"] == "deepseek-v4-flash"
+        assert resp.status == 400
+        assert body["error"]["type"] == "model_not_found"
+        mock_urlopen.assert_not_called()
+
+    @pytest.mark.parametrize("model", ["", 42, {}, []])
+    def test_invalid_model_type_returns_400(self, server, model):
+        port, _ = server
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(
+            "POST",
+            "/v1/responses",
+            json.dumps({"model": model, "input": "hi"}),
+            {"content-type": "application/json"},
+        )
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+
+        assert resp.status == 400
+        assert body["error"]["type"] == "invalid_request_error"
+
+    def test_unknown_streaming_model_returns_json_error_before_sse(self, server):
+        port, _ = server
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(
+            "POST",
+            "/v1/responses",
+            json.dumps({"model": "no-such-model", "input": "hi", "stream": True}),
+            {"content-type": "application/json"},
+        )
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+
+        assert resp.status == 400
+        assert resp.headers["content-type"] == "application/json"
+        assert body["error"]["type"] == "model_not_found"
 
 
 class TestToolCallRoundTrip:

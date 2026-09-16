@@ -11,6 +11,14 @@ from unittest import mock
 import pytest
 
 from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
+from opencode_go_proxy.errors import ProxyError
+from opencode_go_proxy.guards import (
+    CALLER_TOKEN_ENV,
+    CALLER_TOKEN_HEADER,
+    REMOTE_ENV,
+    check_client,
+    validate_bind_security,
+)
 
 
 def make_config(port: int) -> ProxyConfig:
@@ -322,6 +330,60 @@ class TestAllowRemoteEscapeHatch:
 
         assert resp.status == 403
         assert json.loads(raw)["error"]["type"] == "browser_request_rejected"
+
+
+class TestRemoteClientBoundary:
+    TOKEN = "a" * 32
+
+    def test_forged_loopback_host_does_not_admit_remote_client(self):
+        with mock.patch.dict(os.environ, {}, clear=True), pytest.raises(ProxyError) as raised:
+            check_client("192.0.2.10", {"Host": "localhost"})
+
+        assert raised.value.status == 403
+        assert raised.value.error_type == "invalid_client"
+
+    def test_remote_client_requires_separate_caller_token(self):
+        with mock.patch.dict(
+            os.environ,
+            {REMOTE_ENV: "1", CALLER_TOKEN_ENV: self.TOKEN},
+            clear=True,
+        ), pytest.raises(ProxyError) as raised:
+            check_client("192.0.2.10", {})
+
+        assert raised.value.status == 401
+        assert raised.value.error_type == "invalid_caller_token"
+
+    def test_remote_client_accepts_matching_caller_token(self):
+        with mock.patch.dict(
+            os.environ,
+            {REMOTE_ENV: "1", CALLER_TOKEN_ENV: self.TOKEN},
+            clear=True,
+        ):
+            check_client("192.0.2.10", {CALLER_TOKEN_HEADER: self.TOKEN})
+
+    def test_ipv4_mapped_loopback_stays_local(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            check_client("::ffff:127.0.0.1", {})
+
+    def test_non_loopback_bind_fails_closed(self):
+        with mock.patch.dict(os.environ, {}, clear=True), pytest.raises(ValueError, match=REMOTE_ENV):
+            validate_bind_security("0.0.0.0")
+
+    def test_non_loopback_bind_requires_strong_token(self):
+        with mock.patch.dict(
+            os.environ,
+            {REMOTE_ENV: "1", CALLER_TOKEN_ENV: "short"},
+            clear=True,
+        ), pytest.raises(ValueError, match=CALLER_TOKEN_ENV):
+            validate_bind_security("0.0.0.0")
+
+    def test_non_loopback_bind_accepts_explicit_remote_auth(self):
+        with mock.patch.dict(
+            os.environ,
+            {REMOTE_ENV: "1", CALLER_TOKEN_ENV: self.TOKEN},
+            clear=True,
+        ):
+            validate_bind_security("0.0.0.0")
 
 
 class TestValidRequestsPass:

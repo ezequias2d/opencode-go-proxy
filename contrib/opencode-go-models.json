@@ -5,6 +5,118 @@
   "client_version": "0.147.0",
   "models": [
     {
+      "slug": "grok-4.6",
+      "display_name": "Grok 4.6",
+      "description": "Grok 4.6 through the OpenCode Go Responses API.",
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "input_modalities": ["text"]
+    },
+    {
+      "slug": "gpt-5.6-luna",
+      "display_name": "GPT-5.6 Luna (OpenCode Go)",
+      "description": "GPT-5.6 Luna through the OpenCode Go Responses API.",
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "input_modalities": ["text"]
+    },
+    {
+      "slug": "muse-spark-1.3-contributor",
+      "display_name": "Muse Spark 1.3 Contributor",
+      "description": "Regional OpenCode Go Responses model; prompts and completions may be used for training.",
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "input_modalities": ["text", "image"],
+      "apply_patch_tool_type": null
+    },
+    {
+      "slug": "muse-spark-1.2-contributor",
+      "display_name": "Muse Spark 1.2 Contributor",
+      "description": "Regional OpenCode Go Responses model; prompts and completions may be used for training.",
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "input_modalities": ["text", "image"],
+      "apply_patch_tool_type": null
+    },
+    {
+      "slug": "glm-5.3-flash",
+      "display_name": "GLM-5.3 Flash",
+      "description": "GLM-5.3 Flash through OpenCode Go Chat Completions.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "glm-5.3",
+      "display_name": "GLM-5.3",
+      "description": "GLM-5.3 through OpenCode Go Chat Completions.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "kimi-k3",
+      "display_name": "Kimi K3",
+      "description": "Kimi K3 through OpenCode Go Chat Completions.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "longcat-2.0",
+      "display_name": "LongCat 2.0",
+      "description": "LongCat 2.0 through OpenCode Go Chat Completions.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "deepseek-v4.1-flash",
+      "display_name": "DeepSeek V4.1 Flash",
+      "description": "DeepSeek V4.1 Flash through OpenCode Go Chat Completions.",
+      "context_window": 1000000,
+      "max_context_window": 1000000
+    },
+    {
+      "slug": "deepseek-v4-flash-vision-exp",
+      "display_name": "DeepSeek V4 Flash Vision Experimental",
+      "description": "Experimental vision model; image inputs are billed by dimensions.",
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "input_modalities": ["text", "image"]
+    },
+    {
+      "slug": "hy4-preview",
+      "display_name": "HY 4 Preview",
+      "description": "HY 4 Preview through OpenCode Go Chat Completions.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "hy3",
+      "display_name": "HY 3",
+      "description": "HY 3 through OpenCode Go Chat Completions.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "minimax-m2.5",
+      "display_name": "MiniMax M2.5",
+      "description": "MiniMax M2.5 through the OpenCode Go Messages API.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "qwen3.8-max",
+      "display_name": "Qwen3.8 Max",
+      "description": "Qwen3.8 Max through the OpenCode Go Messages API.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
+      "slug": "qwen3.8-flash",
+      "display_name": "Qwen3.8 Flash",
+      "description": "Qwen3.8 Flash through the OpenCode Go Messages API.",
+      "context_window": 272000,
+      "max_context_window": 272000
+    },
+    {
       "slug": "deepseek-v4-flash",
       "display_name": "DeepSeek V4 Flash",
       "description": "Fast, cheap. Best default for everyday coding.",

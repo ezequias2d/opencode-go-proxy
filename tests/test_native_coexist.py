@@ -289,6 +289,7 @@ def test_go_route_never_touches_native_backend(backend: str, proxy_server: int, 
 def test_zen_free_model_relays_upstream_error_envelope(backend: str, proxy_server: int, offline_env) -> None:
     """(c) zen/ always goes to the zen upstream; an upstream error is relayed
     with the zen error type, never replaced by the native backend's body."""
+    _seed_zen_capture("deepseek-v4-flash-free")
     resp = _post(
         proxy_server, {"model": "zen/deepseek-v4-flash-free", "input": "hi"}, auth=CLIENT_AUTH
     )
@@ -327,6 +328,7 @@ def test_concurrent_requests_do_not_cross_contaminate(backend: str, proxy_server
     """(d) native + go + zen fired at the same time each get their own result
     and the native backend log shows exactly the native request."""
     _seed_native_capture("gpt-5.6-terra")
+    _seed_zen_capture("deepseek-v4-flash-free")
     payloads = [
         {"model": "gpt-5.6-terra", "input": "hi", "stream": False},
         {"model": "opencode-go/deepseek-v4-flash", "input": "hi"},
@@ -365,7 +367,7 @@ def test_concurrent_requests_do_not_cross_contaminate(backend: str, proxy_server
 
 
 def test_models_list_serves_each_provider_without_collision(backend: str, proxy_server: int, offline_env) -> None:
-    """(e) /v1/models serves native bare, opencode-go bare, and zen prefixed;
+    """(e) /v1/models serves native bare, Go prefixed, and Zen prefixed;
     the same upstream id from go and zen stays two distinct ids."""
     from opencode_go_proxy import catalog as proxy_catalog
 
@@ -378,11 +380,10 @@ def test_models_list_serves_each_provider_without_collision(backend: str, proxy_
     ids = [entry["id"] for entry in json.loads(resp.raw)["data"]]
 
     assert "gpt-5.6-terra" in ids          # native, bare
-    assert "deepseek-v4-flash" in ids      # opencode-go, bare
+    assert "opencode-go/deepseek-v4-flash" in ids
     assert "zen/deepseek-v4-flash" in ids  # zen, prefixed
-    # The go bare slug and the zen-prefixed slug are distinct ids: the zen
-    # model never shadows (or duplicates) the go model under the bare slug.
-    assert ids.count("deepseek-v4-flash") == 1
+    assert ids.count("opencode-go/deepseek-v4-flash") == 1
+    assert ids.count("zen/deepseek-v4-flash") == 1
     assert ids.count("zen/deepseek-v4-flash") == 1
     assert len(ids) == len(set(ids))
 
@@ -483,4 +484,3 @@ def test_live_zen_route_hits_real_upstream_not_mock(backend: str) -> None:
     if resp.status == 429:
         body = json.loads(resp.raw)
         assert "error" in body and "type" in body["error"]
-

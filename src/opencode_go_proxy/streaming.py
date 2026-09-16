@@ -49,6 +49,7 @@ from .upstream import (
     retry_sleep,
     usage_tokens,
 )
+from .upstream_headers import upstream_user_agent
 from .vision import caption_images_in_messages, is_image_rejection_status
 
 Json = dict[str, Any]
@@ -273,7 +274,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             return urllib.request.Request(url, data=raw_payload, headers={
                 "authorization": f"Bearer {api_key}", "content-type": "application/json",
                 "accept": "text/event-stream",
-                "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+                "user-agent": upstream_user_agent(),
             }, method="POST")
 
         req = _make_req()
@@ -707,7 +708,7 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
     req = urllib.request.Request(url, data=raw_payload, headers={
         "authorization": f"Bearer {api_key}", "content-type": "application/json",
         "accept": "text/event-stream",
-        "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+        "user-agent": upstream_user_agent(),
     }, method="POST")
     trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
 

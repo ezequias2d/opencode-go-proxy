@@ -26,7 +26,8 @@ from opencode_go_proxy.app import (
 )
 from opencode_go_proxy.meter import state_dir
 
-DEAD_SLUG = "north-mini-code-free"
+DEAD_SLUG = "deepseek-v4-flash"
+MERGED_DEAD_SLUG = f"opencode-go/{DEAD_SLUG}"
 
 # The shape seen live from the go gateway: ModelError with "not supported".
 GO_REJECT_BODY = json.dumps(
@@ -87,7 +88,7 @@ class TestTwoStrikeHide:
         # No hide file was written and a render still lists the slug visible.
         assert catalog.read_hidden_models() == set()
         catalog.render_merged_catalog()
-        assert _merged_by_slug()[DEAD_SLUG].get("visibility") != "hide"
+        assert _merged_by_slug()[MERGED_DEAD_SLUG].get("visibility") != "hide"
 
     def test_second_rejection_hides_in_file_and_render(self) -> None:
         _seed_go_catalog()
@@ -97,7 +98,7 @@ class TestTwoStrikeHide:
         assert _unsupported_strikes == {DEAD_SLUG: 2}
         assert catalog.read_hidden_models() == {DEAD_SLUG}
         # The merged catalog was re-rendered once and now marks the slug hidden.
-        assert _merged_by_slug()[DEAD_SLUG]["visibility"] == "hide"
+        assert _merged_by_slug()[MERGED_DEAD_SLUG]["visibility"] == "hide"
 
     def test_prefixed_slug_rejected_never_hidden(self) -> None:
         _seed_go_catalog()
