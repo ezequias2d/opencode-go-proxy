@@ -6,9 +6,11 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
+from .accounts import connect_failed_rotatable, connect_with_failover
 from .config import ProxyConfig
 from .errors import ProxyError
 from .go_models import ANTHROPIC_MESSAGES, OPENAI_CHAT, go_family_for
@@ -110,7 +112,9 @@ def handle_go_responses_request(
         model=model,
         bare_id=bare_id,
         family=family,
-        api_key=_resolve_go_key(config, request_id, model, started),
+        single_key=lambda config_value, rid: _resolve_go_key(
+            config_value, rid, model, started
+        ),
         base_url=config.chat_base_url,
         provider=GO_PROVIDER,
         extra_headers=opencode_session_headers(handler.headers, payload),
@@ -128,7 +132,7 @@ def _handle_go_verbatim_request(
     *,
     family: str,
     endpoint: str,
-    auth_headers: dict[str, str],
+    auth_headers_for: Callable[[str], dict[str, str]],
 ) -> None:
     started = time.time()
     model = str(payload["model"])
@@ -136,32 +140,41 @@ def _handle_go_verbatim_request(
     body = dict(payload)
     body["model"] = bare_id
     raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    headers = {
-        "content-type": "application/json",
-        "accept": "text/event-stream" if payload.get("stream") is True else "application/json",
-        "user-agent": upstream_user_agent(),
-        **opencode_session_headers(handler.headers, payload),
-        **auth_headers,
-    }
+    stream = payload.get("stream") is True
     url = f"{config.chat_base_url}{endpoint}"
-    req = urllib.request.Request(
-        url,
-        data=raw,
-        headers=headers,
-        method="POST",
-    )
+    session_headers = opencode_session_headers(handler.headers, payload)
+
+    def _build(key: str) -> urllib.request.Request:
+        headers = {
+            "content-type": "application/json",
+            "accept": "text/event-stream" if stream else "application/json",
+            "user-agent": upstream_user_agent(),
+            **session_headers,
+            **auth_headers_for(key),
+        }
+        return urllib.request.Request(url, data=raw, headers=headers, method="POST")
+
+    def _resolve_single(config_value: ProxyConfig, rid: str) -> str:
+        return _resolve_go_key(config_value, rid, model, started)
+
     trace(
         "opencode-go.start",
         request_id=request_id,
         url=url,
         bytes=len(raw),
         family=family,
-        stream=payload.get("stream") is True,
+        stream=stream,
     )
-    if payload.get("stream") is True:
+    if stream:
         try:
-            response, retries = _open_upstream_stream(
-                req, config, request_id, default_max_retries()
+            response, retries = connect_with_failover(
+                config,
+                request_id,
+                connect=lambda key: _open_upstream_stream(
+                    _build(key), config, request_id, default_max_retries()
+                ),
+                rotatable=connect_failed_rotatable,
+                resolve_single=_resolve_single,
             )
         except _ConnectFailed as fail:
             exc = fail.exc
@@ -191,39 +204,53 @@ def _handle_go_verbatim_request(
         return
 
     max_retries = default_max_retries()
-    retries = 0
+
+    def _post(key: str) -> tuple[bytes, int, str, int]:
+        """One account's non-stream attempt with the inner transient retry."""
+        retries = 0
+        while True:
+            req = _build(key)
+            try:
+                with urllib.request.urlopen(req, timeout=config.timeout_sec) as response:
+                    return (
+                        response.read(),
+                        response.status,
+                        response.headers.get("content-type", "application/json"),
+                        retries,
+                    )
+            except urllib.error.HTTPError as exc:
+                response_body = exc.read()
+                status = exc.code
+                if retriable_http_status(status) and retries < max_retries:
+                    retries += 1
+                    retry_sleep(retries)
+                    continue
+                raise _ConnectFailed(exc, retries, response_body) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if retries < max_retries:
+                    retries += 1
+                    retry_sleep(retries)
+                    continue
+                raise _ConnectFailed(exc, retries) from exc
+
     retry_after = None
-    while True:
-        try:
-            with urllib.request.urlopen(req, timeout=config.timeout_sec) as response:
-                response_body = response.read()
-                status = response.status
-                content_type = response.headers.get(
-                    "content-type",
-                    "application/json",
-                )
-                break
-        except urllib.error.HTTPError as exc:
-            response_body = exc.read()
-            status = exc.code
-            content_type = exc.headers.get(
-                "content-type",
-                "application/json",
-            )
-            retry_after = (
-                exc.headers.get("retry-after") if exc.headers else None
-            )
-            if retriable_http_status(status) and retries < max_retries:
-                retries += 1
-                retry_sleep(retries)
-                continue
-            break
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            if retries < max_retries:
-                retries += 1
-                retry_sleep(retries)
-                continue
-            raise _network_error(exc, retries) from exc
+    try:
+        response_body, status, content_type, retries = connect_with_failover(
+            config,
+            request_id,
+            connect=_post,
+            rotatable=connect_failed_rotatable,
+            resolve_single=_resolve_single,
+        )
+    except _ConnectFailed as fail:
+        exc = fail.exc
+        if not isinstance(exc, urllib.error.HTTPError):
+            raise _network_error(exc, fail.attempts) from exc
+        response_body = fail.body
+        status = exc.code
+        content_type = exc.headers.get("content-type", "application/json")
+        retry_after = exc.headers.get("retry-after") if exc.headers else None
+        retries = fail.attempts
     client_status = _client_status(status)
     record_usage_event(
         model=model,
@@ -248,7 +275,6 @@ def handle_go_chat_request(
     request_id: str,
 ) -> None:
     """Relay the local Chat Completions surface to a Go Chat model."""
-    started = time.time()
     model = payload.get("model")
     if not isinstance(model, str) or not model:
         raise ProxyError(
@@ -271,11 +297,7 @@ def handle_go_chat_request(
         request_id,
         family=family,
         endpoint="/chat/completions",
-        auth_headers={
-            "authorization": (
-                f"Bearer {_resolve_go_key(config, request_id, model, started)}"
-            )
-        },
+        auth_headers_for=lambda key: {"authorization": f"Bearer {key}"},
     )
 
 
@@ -286,7 +308,6 @@ def handle_go_messages_request(
     request_id: str,
 ) -> None:
     """Relay the local Anthropic Messages surface to a Go Messages model."""
-    started = time.time()
     model = payload.get("model")
     if not isinstance(model, str) or not model:
         raise ProxyError(
@@ -302,7 +323,9 @@ def handle_go_messages_request(
             f"OpenCode Go model {model!r} uses {expected}, not /messages",
             error_type="invalid_request_error",
         )
-    api_key = _resolve_go_key(config, request_id, model, started)
+    anthropic_version = (
+        handler.headers.get("anthropic-version") or ANTHROPIC_VERSION
+    )
     _handle_go_verbatim_request(
         handler,
         payload,
@@ -310,9 +333,8 @@ def handle_go_messages_request(
         request_id,
         family=family,
         endpoint="/messages",
-        auth_headers={
-            "x-api-key": api_key,
-            "anthropic-version": handler.headers.get("anthropic-version")
-            or ANTHROPIC_VERSION,
+        auth_headers_for=lambda key: {
+            "x-api-key": key,
+            "anthropic-version": anthropic_version,
         },
     )

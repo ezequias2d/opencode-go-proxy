@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- Account pool with automatic failover: `OPENCODE_GO_API_KEYS` or an accounts
+  file (`OPENCODE_GO_PROXY_ACCOUNTS_FILE`) provides multiple OpenCode Go
+  credentials; a `401`/`403`/`429` before any byte reaches the client rotates to
+  the next account, with per-account cooldowns and `GET /accounts` reporting the
+  masked pool. `OPENCODE_GO_PROXY_KEY_FAILOVER=0` disables rotation, and
+  `opencode-go-proxy accounts list|use` manages the file source.
+
 ### Security
 
 - Validate the actual client address and require a separate caller token for

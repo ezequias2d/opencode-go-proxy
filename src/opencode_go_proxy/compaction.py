@@ -30,6 +30,7 @@ import uuid
 from http import HTTPStatus
 from typing import Any
 
+from .accounts import connect_with_failover, proxy_error_rotatable
 from .config import ProxyConfig
 from .errors import ProxyError
 from .go_models import go_family_for
@@ -160,7 +161,6 @@ def _summarize_go(model: str, transcript: str, config: ProxyConfig, request_id: 
     """One non-stream OpenCode Go summarization call through the model's family."""
     bare = normalize_model_slug(model)
     family = go_family_for(bare)
-    api_key = resolve_api_key(config, request_id)
     payload: Json = {
         "model": model,
         "input": [
@@ -169,17 +169,7 @@ def _summarize_go(model: str, transcript: str, config: ProxyConfig, request_id: 
         ],
         "stream": False,
     }
-    url, body, headers = _build_family_request(
-        payload,
-        family,
-        bare,
-        api_key,
-        stream=False,
-        session_model=model,
-        base_url=config.chat_base_url,
-        extra_headers=opencode_session_headers(None, payload),
-    )
-    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    session_headers = opencode_session_headers(None, payload)
     trace(
         "compaction.summarize",
         request_id=request_id,
@@ -187,14 +177,30 @@ def _summarize_go(model: str, transcript: str, config: ProxyConfig, request_id: 
         model=bare,
         transcript_chars=len(transcript),
     )
+
+    def _post(api_key: str) -> tuple[Json, int]:
+        url, body, headers = _build_family_request(
+            payload,
+            family,
+            bare,
+            api_key,
+            stream=False,
+            session_model=model,
+            base_url=config.chat_base_url,
+            extra_headers=session_headers,
+        )
+        raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        return _zen_post(
+            url, raw_payload, headers, config, request_id, provider=GO_PROVIDER
+        )
+
     try:
-        value, retries = _zen_post(
-            url,
-            raw_payload,
-            headers,
+        value, retries = connect_with_failover(
             config,
             request_id,
-            provider=GO_PROVIDER,
+            connect=_post,
+            rotatable=proxy_error_rotatable,
+            resolve_single=resolve_api_key,
         )
     except ProxyError as exc:
         if int(exc.status) < 500:
@@ -216,7 +222,6 @@ def _summarize_zen(model: str, transcript: str, config: ProxyConfig, request_id:
     """One non-stream zen summarization call (provider="zen", never double-metered)."""
     bare_id = bare_zen_id(model)
     family = zen_family_for(bare_id)
-    api_key = resolve_api_key(config, request_id)
     zen_payload: Json = {
         "model": model,
         "input": [
@@ -225,12 +230,22 @@ def _summarize_zen(model: str, transcript: str, config: ProxyConfig, request_id:
         ],
         "stream": False,
     }
-    url, body, headers = _build_zen_request(
-        zen_payload, family, bare_id, api_key, stream=False, session_model=model
-    )
-    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
     trace("compaction.summarize", request_id=request_id, target="zen", model=bare_id, transcript_chars=len(transcript))
-    value, retries = _zen_post(url, raw_payload, headers, config, request_id)
+
+    def _post(api_key: str) -> tuple[Json, int]:
+        url, body, headers = _build_zen_request(
+            zen_payload, family, bare_id, api_key, stream=False, session_model=model
+        )
+        raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        return _zen_post(url, raw_payload, headers, config, request_id)
+
+    value, retries = connect_with_failover(
+        config,
+        request_id,
+        connect=_post,
+        rotatable=proxy_error_rotatable,
+        resolve_single=resolve_api_key,
+    )
     summary = _responses_text(_translate_response(value, family, model)) or PLACEHOLDER_SUMMARY
     inp, outp, total = _zen_tokens(value, family)
     return summary, inp, outp, total, retries

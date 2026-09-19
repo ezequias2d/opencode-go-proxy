@@ -224,6 +224,57 @@ The key is used only for Go or Zen upstream requests. It is never substituted
 for Codex's native OpenAI authorization, and the separate remote caller token
 is never forwarded upstream.
 
+## Multiple accounts and failover
+
+A single install normally resolves one credential. To use several OpenCode Go
+subscriptions without editing env vars and restarting, give the proxy a pool:
+
+1. `OPENCODE_GO_API_KEYS` - a comma- or newline-separated list of keys.
+2. An accounts file at `OPENCODE_GO_PROXY_ACCOUNTS_FILE` (default
+   `~/.config/opencode/opencode-go/accounts.json`):
+
+   ```json
+   {
+     "version": 1,
+     "active": "alpha",
+     "accounts": [
+       {"id": "alpha", "name": "alpha", "key": "sk-..."},
+       {"id": "beta", "name": "beta", "key": "sk-..."}
+     ]
+   }
+   ```
+
+3. The single-credential resolution above (a pool of one).
+
+The first source that yields a key wins, and duplicate keys are dropped by
+fingerprint. The accounts file's `active` account is tried first; the proxy
+re-reads the file when its mtime changes, so a switch needs no restart.
+
+When an account is rejected with `401`, `403`, or `429` **before any byte of the
+upstream response reaches the client**, the proxy marks that account cooling
+down and retries the identical request with the next account, at most once per
+account per client request. A `429` cools down for its `Retry-After` value when
+present (seconds or HTTP date) and otherwise for
+`OPENCODE_GO_PROXY_ACCOUNT_COOLDOWN_SEC` (default `300`); a `401`/`403` cools
+down for `OPENCODE_GO_PROXY_ACCOUNT_AUTH_COOLDOWN_SEC` (default `900`). A
+successful turn clears the cooldown. Once a response is committed, or once every
+account has failed, the last upstream error is relayed unchanged. Set
+`OPENCODE_GO_PROXY_KEY_FAILOVER=0` to disable rotation.
+
+`GET /accounts` (and `/v1/accounts`) answers the masked pool - keys are never
+printed or serialized:
+
+```json
+{"source": "file",
+ "active": {"id": "alpha", "name": "alpha", "masked": "sk-3pj…FgAC"},
+ "pool": [{"id": "alpha", "name": "alpha", "masked": "sk-3pj…FgAC",
+           "eligible": true, "cooldownUntil": null,
+           "lastStatus": 429, "failures": 2}]}
+```
+
+Manage the file source with `opencode-go-proxy accounts list` and
+`opencode-go-proxy accounts use <name|id>`.
+
 ## Provider limits and data handling
 
 - OpenCode Go's current limits are dollar-based: $12 per rolling five hours,
@@ -522,6 +573,11 @@ All flags have environment variable defaults:
 | `--api-key-env` | `OPENCODE_GO_PROXY_API_KEY_ENV` | `OPENCODE_GO_API_KEY` |
 | `--timeout-sec` | `OPENCODE_GO_PROXY_TIMEOUT_SEC` | `180` |
 | `--max-body-mb` | `OPENCODE_GO_PROXY_MAX_BODY_MB` | `20` |
+| - | `OPENCODE_GO_API_KEYS` | unset (single credential) |
+| - | `OPENCODE_GO_PROXY_ACCOUNTS_FILE` | `~/.config/opencode/opencode-go/accounts.json` |
+| - | `OPENCODE_GO_PROXY_ACCOUNT_COOLDOWN_SEC` | `300` |
+| - | `OPENCODE_GO_PROXY_ACCOUNT_AUTH_COOLDOWN_SEC` | `900` |
+| - | `OPENCODE_GO_PROXY_KEY_FAILOVER` | `1` |
 
 The proxy accepts both `/responses` and `/v1/responses`.
 
@@ -606,6 +662,9 @@ All commands run as subcommands of the console script, for example `opencode-go-
   the merged catalog; the menu bar's Refresh Catalog calls this.
 - `status [--json]` - reports whether the proxy is running, who owns the port,
   and where logs live.
+- `accounts list|use <name|id>` - prints the masked credential pool with the
+  active entry marked; `use` rewrites the accounts file's `active` account
+  (file source only) and prints the new masked active entry.
 
 ## Model catalog
 

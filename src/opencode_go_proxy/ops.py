@@ -112,6 +112,26 @@ def check_api_key() -> Check:
     )
 
 
+def check_accounts() -> Check:
+    """The credential pool size and source, plus cooling-down count (never a key)."""
+    from . import accounts
+
+    snapshot = accounts.pool_snapshot(_proxy_config())
+    pool = snapshot.get("pool") or []
+    cooling = sum(1 for entry in pool if not entry.get("eligible", True))
+    detail = f"{len(pool)} account(s) from {snapshot.get('source', 'single')}"
+    if cooling:
+        detail += f"; {cooling} cooling down"
+    if not pool:
+        return Check(
+            "accounts",
+            "fail",
+            f"no accounts in source {snapshot.get('source', 'single')}",
+            fix="Set $OPENCODE_GO_API_KEYS or add an accounts file.",
+        )
+    return Check("accounts", "ok", detail)
+
+
 def check_config_file() -> Check:
     """config.toml exists at the path the proxy serves."""
     if os.path.exists(CONFIG_PATH):
@@ -271,6 +291,7 @@ def check_upstream() -> Check:
 def _run_checks() -> list[Check]:
     return [
         check_api_key(),
+        check_accounts(),
         check_config_file(),
         check_config(),
         check_catalog(),

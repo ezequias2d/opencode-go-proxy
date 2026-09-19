@@ -28,10 +28,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from typing import Any
 
+from .accounts import (
+    AccountRejected,
+    account_rejected_rotatable,
+    connect_failed_rotatable,
+    connect_with_failover,
+    proxy_error_rotatable,
+)
 from .config import ProxyConfig
 from .errors import ProxyError
 from .meter import (
@@ -323,6 +330,48 @@ def _build_zen_request(
         session_model=session_model,
         base_url=zen_base_url(),
     )
+
+
+def _keyed_family_request(
+    payload: Json,
+    family: str,
+    bare_id: str,
+    *,
+    stream: bool,
+    session_model: str,
+    base_url: str,
+    extra_headers: Mapping[str, str] | None = None,
+    function_tools_only: bool = False,
+    caption_images: bool = False,
+    config: ProxyConfig | None = None,
+    request_id: str | None = None,
+) -> tuple[str, bytes, Callable[[str], dict[str, str]]]:
+    """Build one family request body once and return a per-key header builder.
+
+    Account failover retries the identical body under a different credential,
+    so the body (and any captioning it triggered) is computed exactly once;
+    only the auth header is rebuilt per account.
+    """
+    url, body, _headers = _build_family_request(
+        payload,
+        family,
+        bare_id,
+        "",
+        stream=stream,
+        session_model=session_model,
+        base_url=base_url,
+        extra_headers=extra_headers,
+        function_tools_only=function_tools_only,
+        caption_images=caption_images,
+        config=config,
+        request_id=request_id,
+    )
+    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+    def headers_for(key: str) -> dict[str, str]:
+        return _family_headers(family, key, stream=stream, extra_headers=extra_headers)
+
+    return url, raw_payload, headers_for
 
 
 def _zen_post(
@@ -1110,16 +1159,27 @@ def call_zen_responses(payload: Json, config: ProxyConfig, request_id: str) -> J
     """Non-stream Responses call through the routed Zen family."""
     model = payload.get("model") or DEFAULT_MODEL
     bare_id = bare_zen_id(model)
-    return call_family_responses(
-        payload,
+    family = zen_family_for(bare_id)
+
+    def _call(api_key: str) -> Json:
+        return call_family_responses(
+            payload,
+            config,
+            request_id,
+            model=model,
+            bare_id=bare_id,
+            family=family,
+            api_key=api_key,
+            base_url=zen_base_url(),
+            provider=ZEN_PROVIDER,
+        )
+
+    return connect_with_failover(
         config,
         request_id,
-        model=model,
-        bare_id=bare_id,
-        family=zen_family_for(bare_id),
-        api_key=resolve_api_key(config, request_id),
-        base_url=zen_base_url(),
-        provider=ZEN_PROVIDER,
+        connect=_call,
+        rotatable=proxy_error_rotatable,
+        resolve_single=resolve_api_key,
     )
 
 
@@ -1146,6 +1206,8 @@ class _ZenStreamEngine:
         started: float,
         raw_payload: bytes,
         provider: str = ZEN_PROVIDER,
+        build_request: Callable[[str], urllib.request.Request] | None = None,
+        single_key: Callable[[ProxyConfig, str], str] | None = None,
     ) -> None:
         self.handler = handler
         self.config = config
@@ -1157,6 +1219,8 @@ class _ZenStreamEngine:
         self.started = started
         self.raw_payload = raw_payload
         self.provider = provider
+        self.build_request = build_request
+        self.single_key = single_key
         self.retries = 0
 
         self.client_alive = True
@@ -1424,6 +1488,29 @@ class _ZenStreamEngine:
         self.next_output_index = 0
         self._active_tool_index = None
 
+    def _connect(self, req: urllib.request.Request) -> tuple[Any, int]:
+        """Open the upstream stream, rotating accounts when a builder is set.
+
+        Without a ``build_request`` builder the engine behaves exactly as
+        before (one request, the caller's key); with one, every account in the
+        pool is tried once on a 401/403/429 rejection before the final failure
+        is re-raised for the caller's relay.
+        """
+        build_request = self.build_request
+        if build_request is None:
+            return _open_upstream_stream(
+                req, self.config, self.request_id, default_max_retries()
+            )
+        return connect_with_failover(
+            self.config,
+            self.request_id,
+            connect=lambda key: _open_upstream_stream(
+                build_request(key), self.config, self.request_id, default_max_retries()
+            ),
+            rotatable=connect_failed_rotatable,
+            resolve_single=self.single_key or resolve_api_key,
+        )
+
     def run_attempt(
         self,
         req: urllib.request.Request,
@@ -1433,12 +1520,7 @@ class _ZenStreamEngine:
         """Connect, stream, translate; returns 'content', 'empty', 'nodata', 'gone', or 'error'."""
         if response is None:
             try:
-                response, attempts = _open_upstream_stream(
-                    req,
-                    self.config,
-                    self.request_id,
-                    default_max_retries(),
-                )
+                response, attempts = self._connect(req)
                 self.retries += attempts
             except _ConnectFailed as fail:
                 self.retries += fail.attempts
@@ -1711,28 +1793,42 @@ def handle_family_responses_request(
     model: str,
     bare_id: str,
     family: str,
-    api_key: str,
+    api_key: str | None = None,
     base_url: str,
     provider: str,
     extra_headers: Mapping[str, str] | None = None,
     function_tools_only: bool = False,
     restore_namespaces: bool = False,
     caption_images: bool = False,
+    single_key: Callable[[ProxyConfig, str], str] | None = None,
 ) -> None:
-    """Serve a Responses request through one certified upstream family."""
+    """Serve a Responses request through one certified upstream family.
+
+    ``api_key`` pins one credential (the single-credential path); when it is
+    None the account pool is resolved with failover, so a 401/403/429 rotates
+    to the next account before any byte reaches the client. ``single_key``
+    overrides the default single-credential resolver so the opencode-go caller
+    can keep its own proxy-error metering.
+    """
     started = time.time()
 
+    def _single(config_value: ProxyConfig, rid: str) -> str:
+        if api_key is not None:
+            return api_key
+        return (single_key or resolve_api_key)(config_value, rid)
+
     if payload.get("stream") is not True:
-        _send_json(
-            handler,
-            call_family_responses(
+        value = connect_with_failover(
+            config,
+            request_id,
+            connect=lambda key: call_family_responses(
                 payload,
                 config,
                 request_id,
                 model=model,
                 bare_id=bare_id,
                 family=family,
-                api_key=api_key,
+                api_key=key,
                 base_url=base_url,
                 provider=provider,
                 extra_headers=extra_headers,
@@ -1740,14 +1836,16 @@ def handle_family_responses_request(
                 restore_namespaces=restore_namespaces,
                 caption_images=caption_images,
             ),
+            rotatable=proxy_error_rotatable,
+            resolve_single=_single,
         )
+        _send_json(handler, value)
         return
 
-    url, body, headers = _build_family_request(
+    url, raw_payload, headers_for = _keyed_family_request(
         payload,
         family,
         bare_id,
-        api_key,
         stream=True,
         session_model=model,
         base_url=base_url,
@@ -1757,11 +1855,24 @@ def handle_family_responses_request(
         config=config,
         request_id=request_id,
     )
-    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(url, data=raw_payload, headers=headers, method="POST")
+
+    def _build_request(key: str) -> urllib.request.Request:
+        return urllib.request.Request(
+            url, data=raw_payload, headers=headers_for(key), method="POST"
+        )
+
+    req = _build_request("")
     trace(f"{provider}.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=True)
     try:
-        response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
+        response, retries = connect_with_failover(
+            config,
+            request_id,
+            connect=lambda key: _open_upstream_stream(
+                _build_request(key), config, request_id, default_max_retries()
+            ),
+            rotatable=connect_failed_rotatable,
+            resolve_single=_single,
+        )
     except _ConnectFailed as fail:
         retries = fail.attempts
         exc = fail.exc
@@ -1831,6 +1942,8 @@ def handle_family_responses_request(
         family=family, bare_id=bare_id, model=model,
         response_id=new_response_id(), started=started, raw_payload=raw_payload,
         provider=provider,
+        build_request=_build_request,
+        single_key=_single,
     )
     engine._start_keepalive()
     try:
@@ -1852,7 +1965,6 @@ def handle_zen_responses_request(handler: Any, payload: Json, config: ProxyConfi
         model=model,
         bare_id=bare_id,
         family=zen_family_for(bare_id),
-        api_key=resolve_api_key(config, request_id),
         base_url=zen_base_url(),
         provider=ZEN_PROVIDER,
     )
@@ -1870,18 +1982,32 @@ def handle_zen_chat_request(handler: Any, payload: Json, config: ProxyConfig, re
     model = payload.get("model") or DEFAULT_MODEL
     ensure_zen_slug(model)
     bare_id = bare_zen_id(model)
-    api_key = resolve_api_key(config, request_id)
+    stream = payload.get("stream") is True
     body = dict(payload)
     body["model"] = bare_id
-    url = _zen_endpoint("openai_chat", bare_id, stream=payload.get("stream") is True)
+    url = _zen_endpoint("openai_chat", bare_id, stream=stream)
     raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    headers = _zen_headers("openai_chat", api_key, stream=payload.get("stream") is True)
 
-    if payload.get("stream") is True:
-        req = urllib.request.Request(url, data=raw_payload, headers=headers, method="POST")
+    if stream:
+        def _build(key: str) -> urllib.request.Request:
+            return urllib.request.Request(
+                url,
+                data=raw_payload,
+                headers=_zen_headers("openai_chat", key, stream=True),
+                method="POST",
+            )
+
         trace("zen.start", request_id=request_id, url=url, bytes=len(raw_payload), family="openai_chat", stream=True)
         try:
-            response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
+            response, retries = connect_with_failover(
+                config,
+                request_id,
+                connect=lambda key: _open_upstream_stream(
+                    _build(key), config, request_id, default_max_retries()
+                ),
+                rotatable=connect_failed_rotatable,
+                resolve_single=resolve_api_key,
+            )
         except _ConnectFailed as fail:
             retries = fail.attempts
             exc = fail.exc
@@ -1911,9 +2037,34 @@ def handle_zen_chat_request(handler: Any, payload: Json, config: ProxyConfig, re
         trace("zen.done", request_id=request_id, family="openai_chat", stream=True, outcome=outcome)
         return
 
-    status, raw, retries, content_type, retry_after = _zen_post_verbatim(
-        url, raw_payload, headers, config, request_id
-    )
+    def _post(key: str) -> tuple[int, bytes, int, str | None, str | None]:
+        status, body, retries, content_type, retry_after = _zen_post_verbatim(
+            url,
+            raw_payload,
+            _zen_headers("openai_chat", key, stream=False),
+            config,
+            request_id,
+        )
+        if status in (401, 403, 429):
+            raise AccountRejected(
+                status, retry_after, body=body, content_type=content_type, retries=retries
+            )
+        return status, body, retries, content_type, retry_after
+
+    try:
+        status, raw, retries, content_type, retry_after = connect_with_failover(
+            config,
+            request_id,
+            connect=_post,
+            rotatable=account_rejected_rotatable,
+            resolve_single=resolve_api_key,
+        )
+    except AccountRejected as rejected:
+        status = rejected.status
+        raw = rejected.body
+        retries = rejected.retries
+        content_type = rejected.content_type
+        retry_after = rejected.retry_after
     _meter_zen(model, started, status, retries=retries or None)
     handler.send_response(status)
     if retry_after:

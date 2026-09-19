@@ -244,6 +244,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             config = self._config()
             self._send_json(config.cache_tracker.snapshot())
             return
+        if self.path in {"/accounts", "/v1/accounts"}:
+            from .accounts import pool_snapshot
+
+            self._send_json(pool_snapshot(self._config()))
+            return
         if self.path in {"/models", "/v1/models"}:
             from opencode_go_proxy import catalog as _catalog
 
@@ -692,6 +697,10 @@ def main(argv: list[str] | None = None) -> None:
         from . import models_cmd
 
         sys.exit(models_cmd.models_cmd(args_list[1:]))
+    if args_list and args_list[0] == "accounts":
+        from . import accounts
+
+        sys.exit(accounts.accounts_cmd(args_list[1:]))
     if args_list and args_list[0] == "native-capture":
         from . import native_models
 

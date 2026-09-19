@@ -51,6 +51,28 @@ def isolated_state_dir(tmp_path) -> None:
 
 
 @pytest.fixture(autouse=True)
+def isolated_accounts(tmp_path, monkeypatch) -> None:
+    """Keep every test off the real accounts file and account-pool env.
+
+    The proxy resolves credentials from an accounts file at a fixed per-user
+    path by default; without this fixture a developer machine that has one
+    would leak real keys into resolution tests. Each test gets a scratch path
+    (usually absent), and the pool/state memos are cleared so cases cannot
+    inherit a previous file's contents.
+    """
+    from opencode_go_proxy import accounts
+
+    monkeypatch.setattr(
+        accounts, "DEFAULT_ACCOUNTS_FILE", str(tmp_path / "accounts.json")
+    )
+    monkeypatch.delenv(accounts.KEYS_ENV, raising=False)
+    monkeypatch.delenv(accounts.ACCOUNTS_FILE_ENV, raising=False)
+    accounts.clear_account_caches()
+    yield
+    accounts.clear_account_caches()
+
+
+@pytest.fixture(autouse=True)
 def isolated_estimate_state() -> None:
     """Zero-input estimation latches are process-global; clear them per test.
 

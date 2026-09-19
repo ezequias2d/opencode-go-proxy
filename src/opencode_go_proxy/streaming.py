@@ -20,6 +20,7 @@ import uuid
 from http import HTTPStatus
 from typing import Any
 
+from .accounts import connect_failed_rotatable, connect_with_failover
 from .config import ProxyConfig
 from .errors import ProxyError
 from .meter import (
@@ -261,24 +262,29 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             if client_alive:
                 _write(b"data: [DONE]\n\n")
 
-        try:
-            api_key = resolve_api_key(config, request_id)
-        except ProxyError as exc:
-            send_error(exc.message)
-            return
-
         url = f"{config.chat_base_url}/chat/completions"
         raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
 
-        def _make_req() -> urllib.request.Request:
+        def _make_req(api_key: str) -> urllib.request.Request:
             return urllib.request.Request(url, data=raw_payload, headers={
                 "authorization": f"Bearer {api_key}", "content-type": "application/json",
                 "accept": "text/event-stream",
                 "user-agent": upstream_user_agent(),
             }, method="POST")
 
-        req = _make_req()
-        trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
+        def _open_with_key(api_key: str) -> tuple[Any, int]:
+            trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
+            return _open_upstream_stream(_make_req(api_key), config, request_id, default_max_retries())
+
+        def _connect() -> tuple[Any, int]:
+            return connect_with_failover(
+                config,
+                request_id,
+                connect=_open_with_key,
+                rotatable=connect_failed_rotatable,
+                resolve_single=resolve_api_key,
+            )
+
         started = time.time()
 
         # Accumulated state shared across attempts so an empty-completion retry
@@ -323,7 +329,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             nonlocal text, reasoning, tool_calls, tool_call_items, tool_call_open, usage
             nonlocal item_open, reasoning_open, reasoning_emitted, total_retries
             nonlocal next_output_index, msg_index, tool_indices, reasoning_index
-            nonlocal req, raw_payload, chat_payload, fell_back, fallback_attempts
+            nonlocal raw_payload, chat_payload, fell_back, fallback_attempts
             nonlocal created_emitted
 
             # Per-attempt emission state; an empty attempt never opens items,
@@ -389,8 +395,11 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             # head was already committed to the client, which we mark as an
             # aborted stream rather than a success.
             try:
-                response, retry_attempts = _open_upstream_stream(req, config, request_id, default_max_retries())
+                response, retry_attempts = _connect()
                 total_retries += retry_attempts
+            except ProxyError as exc:
+                send_error(exc.message)
+                return "error"
             except _ConnectFailed as fail:
                 total_retries += fail.attempts
                 exc = fail.exc
@@ -408,7 +417,6 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
                         conversion_stats["upstream_model"] = chat_payload.get("model")
                         raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
-                        req = _make_req()
                         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload),
                               stream=True, fallback=True)
                         return "fallback"
@@ -702,18 +710,28 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
     disconnects.
     """
     started = time.time()
-    api_key = resolve_api_key(config, request_id)
     url = f"{config.chat_base_url}/chat/completions"
     raw_payload = json.dumps(payload, separators=(",",":")).encode("utf-8")
-    req = urllib.request.Request(url, data=raw_payload, headers={
-        "authorization": f"Bearer {api_key}", "content-type": "application/json",
-        "accept": "text/event-stream",
-        "user-agent": upstream_user_agent(),
-    }, method="POST")
+
+    def _build_request(api_key: str) -> urllib.request.Request:
+        return urllib.request.Request(url, data=raw_payload, headers={
+            "authorization": f"Bearer {api_key}", "content-type": "application/json",
+            "accept": "text/event-stream",
+            "user-agent": upstream_user_agent(),
+        }, method="POST")
+
     trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
 
     try:
-        response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
+        response, retries = connect_with_failover(
+            config,
+            request_id,
+            connect=lambda key: _open_upstream_stream(
+                _build_request(key), config, request_id, default_max_retries()
+            ),
+            rotatable=connect_failed_rotatable,
+            resolve_single=resolve_api_key,
+        )
     except _ConnectFailed as fail:
         retries = fail.attempts
         exc = fail.exc
@@ -942,10 +960,11 @@ def _zen_fallback_stream(
     """
     from opencode_go_proxy.passthrough import _relay_stream
     from opencode_go_proxy.zen_upstream import (
-        _build_zen_request,
+        _keyed_family_request,
         _meter_zen,
         _ZenStreamEngine,
         bare_zen_id,
+        zen_base_url,
         zen_family_for,
     )
 
@@ -953,12 +972,21 @@ def _zen_fallback_stream(
     model = original_payload.get("model") or DEFAULT_MODEL
     bare_id = bare_zen_id(model)
     family = zen_family_for(bare_id)
-    api_key = resolve_api_key(config, request_id)
-    url, body, headers = _build_zen_request(
-        original_payload, family, bare_id, api_key, stream=True, session_model=model
+    url, raw_payload, headers_for = _keyed_family_request(
+        original_payload,
+        family,
+        bare_id,
+        stream=True,
+        session_model=model,
+        base_url=zen_base_url(),
     )
-    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(url, data=raw_payload, headers=headers, method="POST")
+
+    def _build_request(key: str) -> urllib.request.Request:
+        return urllib.request.Request(
+            url, data=raw_payload, headers=headers_for(key), method="POST"
+        )
+
+    req = _build_request("")
     trace("zen.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=True)
     shim = _ZenFallbackHandler(wfile)
 
@@ -966,7 +994,15 @@ def _zen_fallback_stream(
         # Verbatim family: connect once and relay the open stream unchanged
         # (mirror of handle_zen_responses_request's openai_responses branch).
         try:
-            response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
+            response, retries = connect_with_failover(
+                config,
+                request_id,
+                connect=lambda key: _open_upstream_stream(
+                    _build_request(key), config, request_id, default_max_retries()
+                ),
+                rotatable=connect_failed_rotatable,
+                resolve_single=resolve_api_key,
+            )
         except _ConnectFailed as fail:
             retries = fail.attempts
             exc = fail.exc
@@ -992,6 +1028,7 @@ def _zen_fallback_stream(
         shim, original_payload, config, request_id,
         family=family, bare_id=bare_id, model=model,
         response_id=new_response_id(), started=started, raw_payload=raw_payload,
+        build_request=_build_request,
     )
     engine._start_keepalive()
     try:

@@ -67,6 +67,16 @@ def api_key_source(config: ProxyConfig) -> str | None:
 
 
 def resolve_api_key(config: ProxyConfig, request_id: str) -> str:
+    # An account pool (env list or accounts file) supersedes the single
+    # credential: the selected account's key is returned and, because it can
+    # change with cooldowns or a file edit, is never held in the single-key
+    # cache. The single-credential path below keeps its cache and order.
+    from .accounts import resolve_accounts, select_account
+
+    _pool, source = resolve_accounts(config)
+    if source != "single":
+        return select_account(config, request_id).key
+
     global _api_key_cache
     if _api_key_cache:
         return _api_key_cache
