@@ -446,7 +446,7 @@ def test_v2_context_compaction_trigger_streams_expected_sse_sequence(
     added = events[1]
     assert added["output_index"] == 0
     item = added["item"]
-    assert item["type"] == "context_compaction"
+    assert item["type"] == "compaction"
     assert item["id"].startswith("cmp_")
     assert compaction.decode_summary(item["encrypted_content"]) == SUMMARY_TEXT
     assert events[3]["response"]["status"] == "completed"
@@ -480,7 +480,7 @@ def test_v2_compaction_trigger_type_also_detected(
         conn.close()
     events = sse_events(raw)
     assert [event["type"] for event in events][:2] == ["response.created", "response.output_item.added"]
-    assert events[1]["item"]["type"] == "context_compaction"
+    assert events[1]["item"]["type"] == "compaction"
     assert mock_upstream.behavior.count == 1
 
 
@@ -496,7 +496,7 @@ def test_v2_non_stream_returns_json_shape(
     assert status == 200, raw
     body = json.loads(raw)
     assert body["status"] == "completed"
-    assert body["output"][0]["type"] == "context_compaction"
+    assert body["output"][0]["type"] == "compaction"
     assert compaction.decode_summary(body["output"][0]["encrypted_content"]) == SUMMARY_TEXT
 
 

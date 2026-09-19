@@ -8,9 +8,10 @@ the proxy serves. Two wire families exist:
   history; the summary is delivered as a single
   ``{"type": "compaction", "encrypted_content": ...}`` output item.
 - v2: a normal ``/responses`` POST whose input ends in a compaction trigger
-  item (``compaction_trigger`` or ``context_compaction``). The app streams the
-  turn and expects exactly one ``context_compaction`` output item followed by
-  ``response.completed``.
+  item (``compaction_trigger``, or ``context_compaction`` from older builds).
+  The app streams the turn and expects exactly one ``compaction`` output item
+  followed by ``response.completed``; a different item type fails the client
+  task outright, so the same ``compaction`` item serves both paths.
 
 Both families summarize the conversation with one non-streaming chat
 completion against the upstream the session's model routes to (opencode-go
@@ -357,8 +358,15 @@ def handle_compaction(
         )
         raise
     encoded = encode_summary(summary)
+    # The compaction item is ``compaction`` on both paths: Codex 0.155's
+    # remote-compaction-v2 collector counts output items whose type is exactly
+    # ``compaction`` and fails the whole task with "expected exactly one
+    # compaction output item, got 0 from 1 output items" for anything else
+    # (verified against Codex 0.155.1 by driving /compact at a stub backend).
+    # ``context_compaction`` is the request-side trigger vocabulary, not the
+    # response item.
     item: Json = {
-        "type": "context_compaction" if v2 else "compaction",
+        "type": "compaction",
         "id": f"cmp_{uuid.uuid4().hex}",
         "encrypted_content": encoded,
     }
