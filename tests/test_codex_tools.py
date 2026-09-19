@@ -438,3 +438,53 @@ class TestCompact:
         assert resp.status == 200
         assert body["status"] == "completed"
         assert body["output_text"] == "compact answer"
+
+
+def test_snapshot_tool_parameters_are_object_schemas() -> None:
+    """Every emitted app tool carries a top-level object schema.
+
+    A composite snapshot entry (``oneOf`` with no ``type``) makes OpenCode Go
+    answer 400 ``schema must be a JSON Schema of 'type: "object"'`` and kills
+    the turn, so the coercion runs on both capture and load.
+    """
+    composite = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [{"type": "object", "properties": {"mode": {"type": "string"}}}],
+    }
+    captured = codex_tools._normalize_tool("codex_app__automation_update", "desc", composite)
+    assert captured["function"]["parameters"]["type"] == "object"
+    assert "oneOf" in captured["function"]["parameters"]
+
+    stored = [
+        {
+            "type": "function",
+            "function": {
+                "name": "codex_app__automation_update",
+                "description": "desc",
+                "parameters": composite,
+            },
+        }
+    ]
+    with mock.patch.object(codex_tools, "_load_snapshot_tools_raw", lambda: stored):
+        loaded = load_snapshot_tools()
+    assert loaded[0]["function"]["parameters"]["type"] == "object"
+
+    assert codex_tools._normalize_tool("t", "d", {"type": "string"})["function"]["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": True,
+    }
+    assert codex_tools._normalize_tool("t", "d", None)["function"]["parameters"] == {
+        "type": "object",
+        "properties": {},
+    }
+
+
+def test_loaded_snapshot_only_exposes_object_schemas() -> None:
+    """The real snapshot (state capture or contrib fallback) is sanitized."""
+    tools = load_snapshot_tools()
+    assert tools
+    names = {tool["function"]["name"] for tool in tools}
+    assert "codex_app__automation_update" in names
+    for tool in tools:
+        assert tool["function"]["parameters"]["type"] == "object"

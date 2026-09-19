@@ -160,6 +160,8 @@ def test_relays_non_stream_with_client_auth(native_upstream) -> None:
             "content-type": "application/json",
             "accept": "application/json",
             "user-agent": "codex/1.0-test",
+            "chatgpt-account-id": "acct-123",
+            "originator": "codex_exec",
             "x-test-forward": "yes",
             "x-opencode-go-secret": "must-not-leak",
             "x-opencode-go-model": "whatever",
@@ -170,8 +172,10 @@ def test_relays_non_stream_with_client_auth(native_upstream) -> None:
         relay_native_request(handler, payload, make_config(), "req-native")
 
     captured = _FakeChatGpt.captured[0]
-    assert captured["path"] == "/v1/responses"
+    assert captured["path"] == "/responses"
     assert captured["headers"]["authorization"] == "Bearer client-chatgpt-token"
+    assert captured["headers"]["chatgpt-account-id"] == "acct-123"
+    assert captured["headers"]["originator"] == "codex_exec"
     assert captured["headers"]["x-test-forward"] == "yes"
     assert captured["headers"]["content-type"] == "application/json"
     assert captured["headers"]["user-agent"] == "codex/1.0-test"
@@ -354,8 +358,17 @@ def test_proxy_dispatches_native_model_to_passthrough(native_upstream) -> None:
     assert resp.status == 200
     assert json.loads(raw)["model"] == "gpt-5.6-luna"
     captured = _FakeChatGpt.captured[0]
-    assert captured["path"] == "/v1/responses"
+    assert captured["path"] == "/responses"
     assert "sk-should-not-be-forwarded" not in json.dumps(captured["headers"])
+
+
+def test_native_request_url_composes_the_codex_route() -> None:
+    """The relay posts <base>/responses, the same path Codex itself uses."""
+    assert (
+        passthrough.native_request_url("https://chatgpt.com/backend-api/codex")
+        == "https://chatgpt.com/backend-api/codex/responses"
+    )
+    assert passthrough.native_request_url("http://127.0.0.1:9/v1/") == "http://127.0.0.1:9/v1/responses"
 
 
 def test_proxy_dispatches_native_stream_to_passthrough(native_upstream) -> None:

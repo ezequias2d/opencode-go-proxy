@@ -259,7 +259,7 @@ def test_native_relays_verbatim_with_client_auth_only(backend: str, proxy_server
     assert go == [] and zen == []
     assert len(native) == 1
     recorded = native[0]
-    assert recorded["path"] == f"{NATIVE_BASE_PATH}/v1/responses"
+    assert recorded["path"] == f"{NATIVE_BASE_PATH}/responses"
     assert json.loads(recorded["body"]) == payload
     # Exactly one Authorization header, the client's; no second auth header
     # (the go key would arrive as "authorization" if the relay attached it).

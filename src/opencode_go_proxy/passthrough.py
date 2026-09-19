@@ -34,8 +34,20 @@ NATIVE_INSECURE_ENV = "OPENCODE_GO_PROXY_NATIVE_ALLOW_INSECURE"
 NATIVE_PROVIDER = "native"
 
 # The fixed headers relayed from the client request, plus every x-* header
-# that is not an x-opencode-go-* proxy control header.
-FORWARD_HEADERS = ("authorization", "content-type", "accept", "user-agent")
+# that is not an x-opencode-go-* proxy control header. The ChatGPT Codex
+# backend authorizes on ``authorization`` AND ``chatgpt-account-id``: dropping
+# the account header makes every relayed native turn fail upstream.
+FORWARD_HEADERS = (
+    "authorization",
+    "content-type",
+    "accept",
+    "user-agent",
+    "chatgpt-account-id",
+    "originator",
+    "session-id",
+    "thread-id",
+    "version",
+)
 
 # Headers that must never be forwarded end-to-end (RFC 9110 hop-by-hop plus
 # anything a relay owns itself).
@@ -61,6 +73,18 @@ def resolve_native_base_url(explicit: str | None = None) -> str:
     if value:
         return value.rstrip("/")
     return NATIVE_BASE_URL_DEFAULT
+
+
+def native_request_url(base_url: str) -> str:
+    """The Responses endpoint under a native base URL.
+
+    Codex posts ``<base>/responses`` to whatever base it is configured with, and
+    the ChatGPT Codex base (``https://chatgpt.com/backend-api/codex``) carries
+    no version segment; the relay composes the same path. Appending
+    ``/v1/responses`` instead answers 404 from that backend, which is how a
+    relayed native turn fails when Codex changes its route.
+    """
+    return f"{base_url.rstrip('/')}/responses"
 
 
 def _forwarded_headers(handler: Any) -> dict[str, str]:
@@ -192,7 +216,7 @@ def relay_native_request(handler: Any, payload: Json, config: ProxyConfig, reque
     model = payload.get("model") or "unknown"
     base_url = resolve_native_base_url()
     _require_https(base_url)
-    url = f"{base_url}/v1/responses"
+    url = native_request_url(base_url)
     raw_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         url,

@@ -54,11 +54,38 @@ def state_tools_path() -> str:
     return os.path.join(state_dir(), STATE_TOOLS_NAME)
 
 
+def _object_parameters(parameters: Any) -> Json:
+    """Coerce a captured tool schema into the object schema upstreams require.
+
+    Function parameters are always an object schema, but the app snapshot can
+    carry shapes some upstreams reject outright: a composite entry (``oneOf`` /
+    ``anyOf`` / ``allOf`` / ``$ref`` with no top-level ``type``) makes OpenCode
+    Go answer 400 ``schema must be a JSON Schema of 'type: "object"', got
+    'type: null'`` and kills the turn. Adding the missing object type keeps the
+    composite constraint and satisfies the strict validator; a schema whose top
+    level is genuinely not an object degrades to an open object schema rather
+    than failing every request that merges the snapshot.
+    """
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+    params = dict(parameters)
+    schema_type = params.get("type")
+    if schema_type == "object":
+        return params
+    if schema_type is None:
+        composite = any(key in params for key in ("oneOf", "anyOf", "allOf", "$ref"))
+        if composite or not params:
+            params["type"] = "object"
+            params.setdefault("properties", {})
+            return params
+        return {"type": "object", "properties": {}}
+    return {"type": "object", "properties": {}, "additionalProperties": True}
+
+
 def _normalize_tool(flat_name: str, description: Any, parameters: Any) -> Json:
     """One codex_app function entry -> the chat function shape the proxy emits."""
     desc = description if isinstance(description, str) else ""
-    params = parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}}
-    return {"type": "function", "function": {"name": flat_name, "description": desc, "parameters": params}}
+    return {"type": "function", "function": {"name": flat_name, "description": desc, "parameters": _object_parameters(parameters)}}
 
 
 def _collect_codex_app_tools(node: Any, collected: dict[str, Json]) -> None:
@@ -208,7 +235,7 @@ def capture_codex_app_tools() -> list[Json] | None:
     _snapshot_cache = (path, os.stat(path).st_mtime_ns, captured_with, list(tools))
     return tools
 
-def load_snapshot_tools() -> list[Json]:
+def _load_snapshot_tools_raw() -> list[Json]:
     """The codex_app tool list: state-dir capture first, then the contrib fallback.
 
     Revalidation keeps the snapshot honest as the app updates: both a cache
@@ -259,6 +286,28 @@ def load_snapshot_tools() -> list[Json]:
         except (OSError, ValueError, TypeError):
             return []
     return []
+
+
+def _sanitize_tool(tool: Json) -> Json:
+    """A stored snapshot entry with its parameters forced to an object schema."""
+    function = tool.get("function") if isinstance(tool, dict) else None
+    if not isinstance(function, dict):
+        return tool
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        return tool
+    return _normalize_tool(name, function.get("description"), function.get("parameters"))
+
+
+def load_snapshot_tools() -> list[Json]:
+    """The snapshot tool list, sanitized for strict upstreams.
+
+    Stored snapshots are written by an older capture (or by the checked-in
+    contrib file), so the object-schema coercion runs on every load instead of
+    only on a fresh capture: a bad schema in the file would otherwise 400 the
+    whole turn on every request that merges the snapshot.
+    """
+    return [_sanitize_tool(tool) for tool in _load_snapshot_tools_raw()]
 
 
 def _entry_name(tool: Json) -> str | None:
